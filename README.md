@@ -42,7 +42,7 @@ Errors are sent as JSON with `message`, `exception_class`, `stack_trace`, `langu
 
 Same contract as your Lookout instance’s **Ingest API** (`/docs` on the app): `POST /api/ingest` or `POST /api/v1/errors` with `X-Api-Key` or `X-Api-Token` (the Ruby sample sends `api_key` in the JSON body as well).
 
-For distributed tracing, use your preferred OpenTelemetry or Sentry-style propagation and attach `trace_id` / `span_id` fields on the error payload if you correlate manually.
+For distributed tracing, use your preferred OpenTelemetry (or similar) propagation and attach `trace_id` / `span_id` fields on the error payload if you correlate manually.
 
 ## Unified onboarding
 
