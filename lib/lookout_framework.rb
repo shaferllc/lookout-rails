@@ -87,6 +87,7 @@ module LookoutFramework
         action = payload[:action].to_s
         status = payload[:status]
         store.add(type: "http", category: "controller", level: "info", message: "#{cname}##{action} → #{status}")
+        report_http_not_found(payload) if status.to_i == 404
       end
 
       ActiveSupport::Notifications.subscribe("perform_start.active_job") do |_name, _start, _finish, _id, payload|
@@ -158,6 +159,53 @@ module LookoutFramework
       post_ingest(body)
     rescue StandardError
       nil
+    end
+
+    def report_http_not_found(payload)
+      return unless report_http_404_enabled?
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      req = payload[:request]
+      method = req.respond_to?(:request_method) ? req.request_method.to_s.upcase : "GET"
+      path = if req.respond_to?(:fullpath)
+        req.fullpath.to_s
+      else
+        "/"
+      end
+      path = "/#{path}" unless path.start_with?("/")
+      url = if req.respond_to?(:original_url)
+        req.original_url.to_s
+      else
+        "#{base_uri}#{path}"
+      end
+
+      body = {
+        "api_key" => api_key,
+        "message" => "HTTP 404 Not Found: #{method} #{path}",
+        "exception_class" => "ActionController::RoutingError",
+        "level" => "warning",
+        "handled" => true,
+        "language" => "ruby",
+        "route" => path,
+        "url" => url,
+        "breadcrumbs" => store.breadcrumbs.dup,
+        "context" => ruby_context.merge(
+          "http" => {
+            "method" => method,
+            "status_code" => 404,
+            "url" => url,
+            "path" => path
+          }
+        )
+      }
+
+      post_ingest(body)
+    rescue StandardError
+      nil
+    end
+
+    def report_http_404_enabled?
+      ENV.fetch("LOOKOUT_REPORT_HTTP_404", "1").to_s != "0"
     end
 
     def reset_store!
