@@ -26,6 +26,13 @@ Copy-paste **Ruby on Rails** instrumentation (not a published gem) that mirrors 
 | `LOOKOUT_API_KEY` | Project API key |
 | `LOOKOUT_BASE_URI` | Lookout origin (no trailing slash) |
 | `LOOKOUT_INSTRUMENT_SQL` | `1` to record sampled `sql.active_record` breadcrumbs |
+| `LOOKOUT_REMOTE_CONFIG` | `0` to disable fetching per-project config from the dashboard (default on) |
+| `LOOKOUT_REMOTE_CONFIG_TTL` | Seconds to cache the fetched config in-process (default `300`) |
+| `LOOKOUT_DUMPS_ENABLED` | Local override for the **dumps** signal (env > site); unset = follow the dashboard |
+
+### Signal control: dashboard + env override
+
+Errors are always sent. **Dumps** (`LookoutFramework.dump(value)`) are gated by the Lookout dashboard (**Project → Monitoring → Signals**): the SDK fetches **`GET /api/config`** at boot (cached in-process for `LOOKOUT_REMOTE_CONFIG_TTL`) and stops sending dumps when the project has them off. Precedence is **env > site** — set `LOOKOUT_DUMPS_ENABLED=true|false` to override; when env force-enables dumps the SDK sends **`X-Lookout-Env-Forced`** so the server accepts them, and reports the override so the dashboard shows it as "Set by env."
 
 ## What gets recorded
 
