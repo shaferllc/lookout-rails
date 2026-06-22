@@ -3,6 +3,7 @@
 # Copy into config/initializers/lookout_framework.rb (or lib/) and call LookoutFramework.install!
 # See packages/lookout-rails/README.md
 
+require "base64"
 require "json"
 require "net/http"
 require "uri"
@@ -259,6 +260,46 @@ module LookoutFramework
       @sql_sample_every ||= ENV.fetch("LOOKOUT_INSTRUMENT_DATABASE_SAMPLE_EVERY", "5").to_i
     end
 
+    def remote_config_enabled?
+      ENV.fetch("LOOKOUT_REMOTE_CONFIG", "1").to_s != "0"
+    end
+
+    def remote_config_ttl
+      @remote_config_ttl ||= ENV.fetch("LOOKOUT_REMOTE_CONFIG_TTL", "300").to_i
+    end
+
+    # Explicit env override for the dumps signal, or nil when unset. An explicit env var wins over
+    # the dashboard (env > site).
+    def dumps_env_override
+      raw = ENV["LOOKOUT_DUMPS_ENABLED"]
+      return nil if raw.nil? || raw.to_s.strip.empty?
+
+      %w[1 true yes on].include?(raw.to_s.strip.downcase)
+    end
+
+    # Whether to send dumps: env override wins, else the dashboard's remote config, else default on.
+    def dumps_enabled?
+      override = dumps_env_override
+      return override unless override.nil?
+
+      cfg = remote_config.dig("signals", "dumps", "enabled")
+      cfg.nil? ? true : !!cfg
+    end
+
+    # Cached per-project ingest config from GET /api/config. Cached in-process for remote_config_ttl
+    # seconds (this runs in a long-lived Rails process); refreshed lazily when stale.
+    def remote_config
+      return {} unless remote_config_enabled?
+
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      if @remote_config && @remote_config_at && (now - @remote_config_at) < remote_config_ttl
+        return @remote_config
+      end
+
+      @remote_config_at = now
+      @remote_config = fetch_remote_config || @remote_config || {}
+    end
+
     def install!
       return if defined?(@@lookout_installed) && @@lookout_installed
 
@@ -410,6 +451,7 @@ module LookoutFramework
     # Returns the value so it can be used inline: +user = LookoutFramework.dump(user, label: "user")+.
     def dump(value, label: nil)
       return value if api_key.to_s.empty? || base_uri.to_s.empty?
+      return value unless dumps_enabled?
 
       result = DumpSerializer.new.serialize(value, label)
       entry = {
@@ -425,7 +467,7 @@ module LookoutFramework
       }
       entry["environment"] = environment unless environment.to_s.empty?
 
-      post_dump("api_key" => api_key, "entries" => [entry])
+      post_dump({ "api_key" => api_key, "entries" => [entry] }, env_forced: dumps_env_override == true)
       value
     rescue StandardError
       value
@@ -453,11 +495,11 @@ module LookoutFramework
       post_to(ingest_path, body)
     end
 
-    def post_dump(body)
-      post_to(dump_ingest_path, body)
+    def post_dump(body, env_forced: false)
+      post_to(dump_ingest_path, body, env_forced: env_forced)
     end
 
-    def post_to(path, body)
+    def post_to(path, body, env_forced: false)
       path = "/#{path}" unless path.start_with?("/")
       uri = URI.parse("#{base_uri}#{path}")
       http = Net::HTTP.new(uri.host, uri.port)
@@ -468,8 +510,45 @@ module LookoutFramework
       req["Content-Type"] = "application/json"
       req["Accept"] = "application/json"
       req["X-Api-Key"] = api_key
+      # env > site: tell the server this signal is force-enabled by the app's env so it accepts
+      # the request even when the dashboard toggle is off.
+      req["X-Lookout-Env-Forced"] = "1" if env_forced
       req.body = JSON.generate(body)
       http.request(req)
+    end
+
+    def fetch_remote_config
+      return nil if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      uri = URI.parse("#{base_uri}/api/config")
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = uri.scheme == "https"
+      http.open_timeout = 2
+      http.read_timeout = 5
+      req = Net::HTTP::Get.new(uri.request_uri)
+      req["Accept"] = "application/json"
+      req["X-Api-Key"] = api_key
+      report = env_overrides_report
+      req["X-Lookout-Env-Overrides"] = report if report
+
+      res = http.request(req)
+      return nil unless res.is_a?(Net::HTTPSuccess)
+
+      data = JSON.parse(res.body)
+      data.is_a?(Hash) ? data : nil
+    rescue StandardError
+      nil
+    end
+
+    # Base64(JSON) of this app's explicit env signal overrides for the X-Lookout-Env-Overrides
+    # report header, or nil when nothing is pinned by env.
+    def env_overrides_report
+      overrides = {}
+      override = dumps_env_override
+      overrides["dumps"] = { "enabled" => override } unless override.nil?
+      return nil if overrides.empty?
+
+      Base64.strict_encode64(JSON.generate(overrides))
     end
   end
 end
