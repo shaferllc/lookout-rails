@@ -8,6 +8,196 @@ require "net/http"
 require "uri"
 
 module LookoutFramework
+  # Serializes an arbitrary Ruby value into the same normalized dump tree the PHP/JS SDKs emit:
+  # {type, class?, key?, value?, preview?, children?, truncated?, ref?}. Bounded by depth, child
+  # count, string length and total size, with cycle detection and key-based redaction so secrets
+  # never leave the process.
+  class DumpSerializer
+    DEFAULT_REDACT_KEYS = %w[
+      password pass pwd secret token api_key apikey authorization auth
+      access_token refresh_token private_key card card_number cvv cvc ssn
+    ].freeze
+
+    def initialize(max_depth: 6, max_children: 100, max_string: 8192, max_total_bytes: 262_144, redact_keys: DEFAULT_REDACT_KEYS)
+      @max_depth = max_depth
+      @max_children = max_children
+      @max_string = max_string
+      @max_total_bytes = max_total_bytes
+      @redact_keys = redact_keys
+    end
+
+    def serialize(value, _label = nil)
+      @total_bytes = 0
+      @truncated = false
+      @seen = {}
+      tree = node(value, nil, 0)
+      {
+        "tree" => tree,
+        "preview" => tree["preview"] || describe(value),
+        "root_type" => tree["type"] || type_of(value),
+        "root_class" => object?(value) ? value.class.name : nil,
+        "truncated" => @truncated
+      }
+    end
+
+    private
+
+    def node(value, key, depth)
+      n = {}
+      n["key"] = cap(key.to_s, 128) unless key.nil?
+
+      if !key.nil? && redact?(key.to_s)
+        @truncated = true
+        n["type"] = "redacted"
+        n["preview"] = "[redacted]"
+        return n
+      end
+
+      if depth >= @max_depth
+        @truncated = true
+        n["type"] = "truncated"
+        n["preview"] = describe(value)
+        return n
+      end
+
+      case value
+      when Hash
+        with_cycle_guard(n, value) { container(n, value, "array", nil, depth) }
+      when Array
+        with_cycle_guard(n, value) { container(n, array_pairs(value), "array", nil, depth) }
+      when String, Symbol, Integer, Float, TrueClass, FalseClass, NilClass
+        scalar(n, value)
+      else
+        with_cycle_guard(n, value) { container(n, object_props(value), "object", value.class.name, depth) }
+      end
+    end
+
+    # Reference types (Hash, Array, objects) can form cycles; emit a ref node instead of recursing.
+    def with_cycle_guard(n, value)
+      oid = value.object_id
+      if @seen[oid]
+        n["type"] = "ref"
+        n["ref"] = oid
+        n["preview"] = "#{value.class.name} {ref ##{oid}}"
+        return n
+      end
+      @seen[oid] = true
+      result = yield
+      @seen.delete(oid)
+      result
+    end
+
+    def container(n, items, type, klass, depth)
+      n["type"] = type
+      n["class"] = cap(klass, 255) if klass
+      count = items.size
+      n["preview"] = klass ? "#{klass} {##{count}}" : "array:#{count} […]"
+
+      children = []
+      i = 0
+      items.each do |k, v|
+        if i >= @max_children
+          @truncated = true
+          children << { "type" => "truncated", "preview" => "+#{count - @max_children} more" }
+          break
+        end
+        if @total_bytes >= @max_total_bytes
+          @truncated = true
+          children << { "type" => "truncated", "preview" => "…" }
+          break
+        end
+        children << node(v, k, depth + 1)
+        i += 1
+      end
+      n["children"] = children unless children.empty?
+      n
+    end
+
+    def scalar(n, value)
+      case value
+      when String, Symbol
+        s = value.to_s
+        capped = cap(s, @max_string)
+        if capped.bytesize < s.bytesize
+          @truncated = true
+          n["truncated"] = true
+        end
+        n["type"] = "string"
+        n["value"] = capped
+        @total_bytes += capped.bytesize
+      when Integer
+        n["type"] = "int"
+        n["value"] = value
+        @total_bytes += 8
+      when Float
+        n["type"] = "float"
+        n["value"] = value
+        @total_bytes += 8
+      when TrueClass, FalseClass
+        n["type"] = "bool"
+        n["value"] = value
+        @total_bytes += 8
+      when NilClass
+        n["type"] = "null"
+        n["value"] = nil
+        @total_bytes += 8
+      end
+      n
+    end
+
+    def array_pairs(arr)
+      pairs = {}
+      arr.each_with_index { |v, i| pairs[i] = v }
+      pairs
+    end
+
+    def object_props(value)
+      out = {}
+      value.instance_variables.each do |ivar|
+        out[ivar.to_s.sub(/\A@/, "")] = value.instance_variable_get(ivar)
+      end
+      out
+    rescue StandardError
+      {}
+    end
+
+    def object?(value)
+      !value.is_a?(Hash) && !value.is_a?(Array) &&
+        !value.is_a?(String) && !value.is_a?(Symbol) && !value.is_a?(Numeric) &&
+        value != true && value != false && !value.nil?
+    end
+
+    def type_of(value)
+      case value
+      when String, Symbol then "string"
+      when Integer then "int"
+      when Float then "float"
+      when TrueClass, FalseClass then "bool"
+      when NilClass then "null"
+      when Array then "array"
+      when Hash then "array"
+      else "object"
+      end
+    end
+
+    def describe(value)
+      return value.class.name if object?(value)
+      return "array:#{value.size}" if value.is_a?(Array) || value.is_a?(Hash)
+      return cap(value.to_s, 64) if value.is_a?(String) || value.is_a?(Symbol)
+
+      value.class.name
+    end
+
+    def redact?(key)
+      needle = key.downcase
+      @redact_keys.any? { |bad| needle == bad || needle.include?(bad) }
+    end
+
+    def cap(str, max)
+      str.length > max ? str[0, max] : str
+    end
+  end
+
   class Store
     attr_reader :breadcrumbs
 
@@ -51,6 +241,14 @@ module LookoutFramework
 
     def ingest_path
       @ingest_path ||= ENV.fetch("LOOKOUT_ERROR_INGEST_PATH", "/api/ingest")
+    end
+
+    def dump_ingest_path
+      @dump_ingest_path ||= ENV.fetch("LOOKOUT_DUMP_INGEST_PATH", "/api/ingest/dump")
+    end
+
+    def environment
+      @environment ||= ENV["LOOKOUT_ENVIRONMENT"]
     end
 
     def max_breadcrumbs
@@ -208,6 +406,31 @@ module LookoutFramework
       ENV.fetch("LOOKOUT_REPORT_HTTP_404", "1").to_s != "0"
     end
 
+    # Explicit dump API: capture a value (as a normalized, redacted tree) to the Lookout Dumps watcher.
+    # Returns the value so it can be used inline: +user = LookoutFramework.dump(user, label: "user")+.
+    def dump(value, label: nil)
+      return value if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      result = DumpSerializer.new.serialize(value, label)
+      entry = {
+        "label" => label,
+        "source" => "rails",
+        "preview" => result["preview"],
+        "root_type" => result["root_type"],
+        "root_class" => result["root_class"],
+        "tree" => result["tree"],
+        "truncated" => result["truncated"],
+        "format" => "json",
+        "dumped_at" => Time.now.utc.iso8601
+      }
+      entry["environment"] = environment unless environment.to_s.empty?
+
+      post_dump("api_key" => api_key, "entries" => [entry])
+      value
+    rescue StandardError
+      value
+    end
+
     def reset_store!
       store.clear
       @query_seq = 0
@@ -227,7 +450,14 @@ module LookoutFramework
     end
 
     def post_ingest(body)
-      path = ingest_path
+      post_to(ingest_path, body)
+    end
+
+    def post_dump(body)
+      post_to(dump_ingest_path, body)
+    end
+
+    def post_to(path, body)
       path = "/#{path}" unless path.start_with?("/")
       uri = URI.parse("#{base_uri}#{path}")
       http = Net::HTTP.new(uri.host, uri.port)
