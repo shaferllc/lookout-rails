@@ -7,6 +7,8 @@ require "base64"
 require "digest"
 require "json"
 require "net/http"
+require "securerandom"
+require "time" # Time#iso8601 (stdlib); under Rails it's already loaded, but don't depend on load order
 require "uri"
 
 module LookoutFramework
@@ -249,6 +251,19 @@ module LookoutFramework
       @dump_ingest_path ||= ENV.fetch("LOOKOUT_DUMP_INGEST_PATH", "/api/ingest/dump")
     end
 
+    def trace_ingest_path
+      @trace_ingest_path ||= ENV.fetch("LOOKOUT_TRACE_INGEST_PATH", "/api/ingest/trace")
+    end
+
+    def job_ingest_path
+      @job_ingest_path ||= ENV.fetch("LOOKOUT_JOB_INGEST_PATH", "/api/ingest/job")
+    end
+
+    # Cap on child spans per request trace (server allows root + 199 children; stay under it).
+    def trace_max_spans
+      @trace_max_spans ||= [[ENV.fetch("LOOKOUT_TRACE_MAX_SPANS", "190").to_i, 1].max, 199].min
+    end
+
     def environment
       @environment ||= ENV["LOOKOUT_ENVIRONMENT"]
     end
@@ -285,6 +300,43 @@ module LookoutFramework
 
       cfg = remote_config.dig("signals", "dumps", "enabled")
       cfg.nil? ? true : !!cfg
+    end
+
+    # Explicit env override for performance/request traces, or nil when unset (env > site).
+    def traces_env_override
+      raw = ENV["LOOKOUT_PERFORMANCE_ENABLED"]
+      return nil if raw.nil? || raw.to_s.strip.empty?
+
+      %w[1 true yes on].include?(raw.to_s.strip.downcase)
+    end
+
+    # Whether to capture + send request traces. Unlike dumps, performance ingest is opt-in on the
+    # server (projects.performance_ingest_enabled defaults off), so this defaults to OFF: enable it
+    # with LOOKOUT_PERFORMANCE_ENABLED=1 (which also force-accepts via X-Lookout-Env-Forced) or by
+    # turning the signal on in the dashboard (Project → Monitoring → Signals).
+    def traces_enabled?
+      override = traces_env_override
+      return override unless override.nil?
+
+      !!remote_config.dig("signals", "traces", "enabled")
+    end
+
+    # Explicit env override for the Active Job → Queues signal, or nil when unset (env > site).
+    def jobs_env_override
+      raw = ENV["LOOKOUT_JOBS_ENABLED"]
+      return nil if raw.nil? || raw.to_s.strip.empty?
+
+      %w[1 true yes on].include?(raw.to_s.strip.downcase)
+    end
+
+    # Whether to send Active Job runs to the Queues watcher. Opt-in on the server
+    # (projects.job_ingest_enabled defaults off), so defaults OFF: LOOKOUT_JOBS_ENABLED=1 (also
+    # force-accepts via X-Lookout-Env-Forced) or turn the signal on in the dashboard.
+    def jobs_enabled?
+      override = jobs_env_override
+      return override unless override.nil?
+
+      !!remote_config.dig("signals", "jobs", "enabled")
     end
 
     # Cached per-project ingest config from GET /api/config. Cached in-process for remote_config_ttl
@@ -340,23 +392,30 @@ module LookoutFramework
 
       store.max = max_breadcrumbs
 
-      ActiveSupport::Notifications.subscribe("start_processing.action_dispatch") do |_name, _start, _finish, _id, payload|
+      ActiveSupport::Notifications.subscribe("start_processing.action_controller") do |_name, _start, _finish, _id, payload|
         reset_store!
         req = payload[:request]
-        if req
-          path = req.respond_to?(:filtered_path) ? req.filtered_path : req.fullpath
-          method = req.request_method
-          store.add(type: "http", category: "dispatch", level: "info", message: "#{method} #{path}")
+        method = payload[:method] || (req && req.request_method)
+        path = if req && req.respond_to?(:filtered_path)
+          req.filtered_path
+        elsif req
+          req.fullpath
+        else
+          payload[:path]
         end
+        store.add(type: "http", category: "dispatch", level: "info", message: "#{method} #{path}") if method || path
+        begin_trace!(method, path) if traces_enabled?
       end
 
-      ActiveSupport::Notifications.subscribe("process_action.action_controller") do |_name, _start, _finish, _id, payload|
-        ctrl = payload[:controller]
-        cname = ctrl.respond_to?(:class) ? ctrl.class.name : "unknown"
+      ActiveSupport::Notifications.subscribe("process_action.action_controller") do |_name, _start, finish, _id, payload|
+        # payload[:controller] is the controller class *name* (a String), not an instance.
+        cname = payload[:controller].to_s
+        cname = "unknown" if cname.empty?
         action = payload[:action].to_s
         status = payload[:status]
         store.add(type: "http", category: "controller", level: "info", message: "#{cname}##{action} → #{status}")
         report_http_not_found(payload) if status.to_i == 404
+        finish_trace!(payload, finish) if trace
       end
 
       ActiveSupport::Notifications.subscribe("perform_start.active_job") do |_name, _start, _finish, _id, payload|
@@ -369,9 +428,20 @@ module LookoutFramework
         data = {}
         data["job_id"] = jid if jid
         store.add(type: "queue", category: "job", level: "info", message: "Job started: #{jname}", data: data)
+        # Open a job run (status: in_progress) for the Queues watcher.
+        begin_job_run!(job) if jobs_enabled?
       end
 
-      %w[perform.active_job enqueue.active_job discard.active_job retry_stopped.active_job].each do |ev|
+      # perform.active_job spans the actual execution and carries payload[:exception_object] on
+      # failure — close the job run (ok/error) here.
+      ActiveSupport::Notifications.subscribe("perform.active_job") do |_name, _start, _finish, _id, payload|
+        job = payload[:job]
+        jname = job ? job.class.name : "unknown"
+        store.add(type: "queue", category: "job", level: "info", message: "perform.active_job: #{jname}")
+        finish_job_run!(payload) if job && job_runs.key?(job_run_key(job))
+      end
+
+      %w[enqueue.active_job discard.active_job retry_stopped.active_job].each do |ev|
         ActiveSupport::Notifications.subscribe(ev) do |_name, _start, _finish, _id, payload|
           job = payload[:job]
           jname = job ? job.class.name : "unknown"
@@ -379,9 +449,16 @@ module LookoutFramework
         end
       end
 
-      return unless ENV["LOOKOUT_INSTRUMENT_SQL"].to_s == "1"
+      # Subscribe to SQL when either feature wants it: breadcrumbs (LOOKOUT_INSTRUMENT_SQL, sampled)
+      # and/or db.query child spans for request traces (when performance is enabled at boot).
+      instrument_sql = ENV["LOOKOUT_INSTRUMENT_SQL"].to_s == "1"
+      return unless instrument_sql || traces_enabled?
 
-      ActiveSupport::Notifications.subscribe("sql.active_record") do |_name, _start, _finish, _id, payload|
+      ActiveSupport::Notifications.subscribe("sql.active_record") do |_name, start, finish, _id, payload|
+        record_query_span(payload, start, finish) if trace
+
+        next unless instrument_sql
+
         @query_seq += 1
         every = [sql_sample_every, 1].max
         next if (@query_seq % every) != 0
@@ -507,15 +584,258 @@ module LookoutFramework
       value
     end
 
+    # Wrap a CLI / rake task run so it shows up in the Commands watcher. Rails has no CommandStarting
+    # event the way Laravel's artisan does, so this is an explicit wrapper:
+    #
+    #   task :backup do
+    #     LookoutFramework.command("rake backup") { do_the_work }
+    #   end
+    #
+    # Captures a root `console.command` span (+ db.query children for SQL run inside the block) with
+    # the exit code, and posts it **synchronously** to the trace ingest API — a rake process exits
+    # the moment the block returns, so an off-thread post would be lost. Re-raises so the task still
+    # fails; gated by the same performance signal as request traces.
+    def command(name, &block)
+      active = traces_enabled? && !api_key.to_s.empty? && !base_uri.to_s.empty?
+      return (block ? block.call : nil) unless active
+
+      Thread.current[:_lookout_trace] = {
+        "trace_id" => SecureRandom.hex(16),
+        "root_id" => SecureRandom.hex(8),
+        "name" => name.to_s,
+        "start" => Time.now.to_f,
+        "spans" => []
+      }
+      exit_code = 0
+      begin
+        block ? block.call : nil
+      rescue Exception # rubocop:disable Lint/RescueException -- record the failure, then re-raise
+        exit_code = 1
+        raise
+      ensure
+        finish_command_trace!(exit_code)
+      end
+    end
+
     def reset_store!
       store.clear
       @query_seq = 0
+      Thread.current[:_lookout_trace] = nil
     end
 
     private
 
     def store
       Thread.current[:_lookout_framework_store] ||= Store.new.tap { |s| s.max = max_breadcrumbs }
+    end
+
+    # Request-scoped trace accumulator (or nil when no trace is active on this thread).
+    def trace
+      Thread.current[:_lookout_trace]
+    end
+
+    # Open a request trace: a root http.server span plus a buffer for child spans. We stamp epoch
+    # time with Time.now (not the notification's start arg, which may be a monotonic clock value) so
+    # the absolute "when" the dashboard shows is correct; child-span durations are computed from
+    # event start/finish deltas, which are clock-agnostic.
+    def begin_trace!(method, path)
+      Thread.current[:_lookout_trace] = {
+        "trace_id" => SecureRandom.hex(16),
+        "root_id" => SecureRandom.hex(8),
+        "method" => (method && method.to_s),
+        "path" => (path && path.to_s),
+        "start" => Time.now.to_f,
+        "spans" => []
+      }
+    end
+
+    # Append a db.query child span for an executed (non-cached) SQL statement.
+    def record_query_span(payload, qstart, qfinish)
+      t = trace
+      return if t.nil? || payload[:cached]
+      return if t["spans"].size >= trace_max_spans
+
+      duration = begin
+        d = (qfinish - qstart).to_f
+        d.negative? ? 0.0 : d
+      rescue StandardError
+        0.0
+      end
+      ended = Time.now.to_f
+      sql = payload[:sql].to_s
+      sql = sql[0, 2000] + "…" if sql.length > 2000
+      data = { "db.duration_ms" => (duration * 1000).round(3) }
+      data["db.name"] = payload[:name].to_s if payload[:name]
+
+      t["spans"] << {
+        "span_id" => SecureRandom.hex(8),
+        "parent_span_id" => t["root_id"],
+        "op" => "db.query",
+        "description" => sql,
+        "start_timestamp" => ended - duration,
+        "end_timestamp" => ended,
+        "status" => "ok",
+        "data" => data
+      }
+    end
+
+    # Per-thread map of in-flight job runs, keyed by job id, holding the client-generated run_id and
+    # start time so perform.active_job can close the run perform_start opened.
+    def job_runs
+      Thread.current[:_lookout_job_runs] ||= {}
+    end
+
+    def job_run_key(job)
+      (job.respond_to?(:job_id) && job.job_id) ? job.job_id.to_s : job.object_id.to_s
+    end
+
+    # Open a job run: POST status=in_progress with a fresh client-generated run_id. Synchronous and
+    # ordered before the completion event, which the server requires (it updates this row by run_id).
+    def begin_job_run!(job)
+      return unless job
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      run_id = SecureRandom.uuid
+      job_runs[job_run_key(job)] = { "run_id" => run_id, "start" => Time.now.to_f }
+      post_job(job_event_body(job, "in_progress", run_id))
+    rescue StandardError
+      nil
+    end
+
+    # Close a job run: POST status=ok/error with the same run_id, the wall-clock duration, and the
+    # exception (when the job raised).
+    def finish_job_run!(payload)
+      job = payload[:job]
+      entry = job && job_runs.delete(job_run_key(job))
+      return if entry.nil?
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      exception = payload[:exception_object]
+      body = job_event_body(job, exception ? "error" : "ok", entry["run_id"])
+      duration = Time.now.to_f - entry["start"].to_f
+      body["duration"] = duration.round(6) if duration >= 0
+      if exception
+        body["exception"] = {
+          "class" => exception.class.name,
+          "message" => exception.message.to_s[0, 1024],
+          "stack" => Array(exception.backtrace).join("\n")[0, 20_000]
+        }
+      end
+      post_job(body)
+    rescue StandardError
+      nil
+    end
+
+    # Shared job-event payload (omitting blanks). attempt = ActiveJob executions (1 on first try).
+    def job_event_body(job, status, run_id)
+      body = {
+        "job" => job.class.name,
+        "status" => status,
+        "run_id" => run_id,
+        "attempt" => job_attempt(job)
+      }
+      queue = (job.respond_to?(:queue_name) ? job.queue_name.to_s : "")
+      body["queue"] = queue unless queue.empty?
+      connection = job_connection(job)
+      body["connection"] = connection if connection
+      body["environment"] = environment unless environment.to_s.empty?
+      body
+    end
+
+    def job_attempt(job)
+      n = job.respond_to?(:executions) ? job.executions.to_i : 1
+      [[n, 1].max, 255].min
+    end
+
+    def job_connection(job)
+      klass = job.class
+      return nil unless klass.respond_to?(:queue_adapter_name)
+
+      name = klass.queue_adapter_name.to_s
+      name.empty? ? nil : name[0, 64]
+    rescue StandardError
+      nil
+    end
+
+    # Close a console.command trace and post it synchronously (the CLI process exits next).
+    def finish_command_trace!(exit_code)
+      t = trace
+      Thread.current[:_lookout_trace] = nil
+      return if t.nil?
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      data = { "exit_code" => exit_code.to_i }
+      query_count = t["spans"].count { |s| s["op"] == "db.query" }
+      data["db.query_count"] = query_count if query_count.positive?
+
+      root = {
+        "span_id" => t["root_id"],
+        "parent_span_id" => nil,
+        "op" => "console.command",
+        "description" => t["name"],
+        "start_timestamp" => t["start"],
+        "end_timestamp" => Time.now.to_f,
+        # The Commands watcher counts failures by status == "error" (not "internal_error").
+        "status" => exit_code.to_i.zero? ? "ok" : "error",
+        "data" => data
+      }
+
+      body = {
+        "trace_id" => t["trace_id"],
+        "transaction" => t["name"],
+        "spans" => [root] + t["spans"]
+      }
+      body["environment"] = environment unless environment.to_s.empty?
+
+      post_to(trace_ingest_path, body, env_forced: traces_env_override == true)
+    rescue StandardError
+      nil
+    end
+
+    # Close the request trace and post it (root http.server span + children) to the trace ingest API.
+    def finish_trace!(payload, _finished_at)
+      t = trace
+      Thread.current[:_lookout_trace] = nil
+      return if t.nil?
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+      return unless traces_enabled?
+
+      cname = payload[:controller].to_s
+      action = payload[:action].to_s
+      status = payload[:status].to_i
+      status = 500 if status.zero? && (payload[:exception] || payload[:exception_object])
+
+      description = [t["method"], t["path"]].compact.join(" ").strip
+      description = "#{cname}##{action}" if description.empty?
+
+      data = {}
+      data["http.method"] = t["method"] if t["method"]
+      data["http.route"] = cname.empty? ? t["path"] : "#{cname}##{action}"
+      data["http.status_code"] = status if status.positive?
+      query_count = t["spans"].count { |s| s["op"] == "db.query" }
+      data["db.query_count"] = query_count if query_count.positive?
+
+      root = {
+        "span_id" => t["root_id"],
+        "parent_span_id" => nil,
+        "op" => "http.server",
+        "description" => description,
+        "start_timestamp" => t["start"],
+        "end_timestamp" => Time.now.to_f,
+        "status" => status >= 500 ? "internal_error" : "ok",
+        "data" => data
+      }
+
+      body = {
+        "trace_id" => t["trace_id"],
+        "transaction" => description,
+        "spans" => [root] + t["spans"]
+      }
+      body["environment"] = environment unless environment.to_s.empty?
+
+      post_trace(body, env_forced: traces_env_override == true)
+    rescue StandardError
+      nil
     end
 
     def ruby_context
@@ -531,6 +851,22 @@ module LookoutFramework
 
     def post_dump(body, env_forced: false)
       post_to(dump_ingest_path, body, env_forced: env_forced)
+    end
+
+    # Traces fire on every request, so post off-thread to keep tracing off the response's critical
+    # path. Best-effort: failures are swallowed like the other signals.
+    def post_trace(body, env_forced: false)
+      Thread.new do
+        post_to(trace_ingest_path, body, env_forced: env_forced)
+      rescue StandardError
+        nil
+      end
+    end
+
+    # Job runs post synchronously: the completion event must reach the server *after* its in_progress
+    # row exists (the server updates by run_id), and jobs run off the request path so latency is fine.
+    def post_job(body, env_forced: jobs_env_override == true)
+      post_to(job_ingest_path, body, env_forced: env_forced)
     end
 
     def post_to(path, body, env_forced: false)
@@ -578,8 +914,12 @@ module LookoutFramework
     # report header, or nil when nothing is pinned by env.
     def env_overrides_report
       overrides = {}
-      override = dumps_env_override
-      overrides["dumps"] = { "enabled" => override } unless override.nil?
+      dumps = dumps_env_override
+      overrides["dumps"] = { "enabled" => dumps } unless dumps.nil?
+      traces = traces_env_override
+      overrides["traces"] = { "enabled" => traces } unless traces.nil?
+      jobs = jobs_env_override
+      overrides["jobs"] = { "enabled" => jobs } unless jobs.nil?
       return nil if overrides.empty?
 
       Base64.strict_encode64(JSON.generate(overrides))
