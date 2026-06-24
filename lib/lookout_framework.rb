@@ -269,6 +269,48 @@ module LookoutFramework
     end
   end
 
+  # Prepended to Net::HTTP (opt-in) so outbound requests become http.client spans on the active trace.
+  module HttpInstrumentation
+    def request(req, body = nil, &block)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      response = super
+      LookoutFramework.send(:record_http_span, self, req, response, started)
+      response
+    rescue StandardError => e
+      begin
+        LookoutFramework.send(:record_http_span, self, req, nil, started, e)
+      rescue StandardError
+        nil
+      end
+      raise
+    end
+  end
+
+  # Registered as a redis-client middleware (opt-in) so commands become db.redis spans.
+  module RedisInstrumentation
+    def call(command, redis_config)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      super
+    ensure
+      begin
+        LookoutFramework.send(:record_redis_span, command, started)
+      rescue StandardError
+        nil
+      end
+    end
+
+    def call_pipelined(commands, redis_config)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      super
+    ensure
+      begin
+        Array(commands).each { |c| LookoutFramework.send(:record_redis_span, c, started) }
+      rescue StandardError
+        nil
+      end
+    end
+  end
+
   class << self
     attr_writer :api_key, :base_uri, :ingest_path
 
@@ -570,6 +612,24 @@ module LookoutFramework
 
       # Opt-in: mirror Rails.logger output to the Logs watcher (LOOKOUT_FORWARD_RAILS_LOG=1).
       attach_log_forwarder! if forward_rails_log?
+
+      # Rails.cache reads/writes/deletes → cache.* child spans → Cache watcher (needs perf at boot).
+      # Rails ≥ 5.2 always emits cache_* notifications (the old Cache::Store.instrument flag is gone).
+      if traces_enabled?
+        ActiveSupport::Notifications.subscribe("cache_read.active_support") do |_n, qs, qf, _i, payload|
+          record_cache_span("cache.get", qs, qf, payload, payload[:hit] ? "hit" : "miss", payload[:hit])
+        end
+        ActiveSupport::Notifications.subscribe("cache_write.active_support") do |_n, qs, qf, _i, payload|
+          record_cache_span("cache.set", qs, qf, payload, "ok", nil)
+        end
+        ActiveSupport::Notifications.subscribe("cache_delete.active_support") do |_n, qs, qf, _i, payload|
+          record_cache_span("cache.remove", qs, qf, payload, "ok", nil)
+        end
+      end
+
+      # Opt-in outbound-HTTP + Redis instrumentation (no standard ActiveSupport events for these).
+      instrument_http! if env_flag("LOOKOUT_INSTRUMENT_HTTP")
+      instrument_redis! if env_flag("LOOKOUT_INSTRUMENT_REDIS")
 
       # Subscribe to SQL when either feature wants it: breadcrumbs (LOOKOUT_INSTRUMENT_SQL, sampled)
       # and/or db.query child spans for request traces (when performance is enabled at boot).
@@ -962,6 +1022,9 @@ module LookoutFramework
       sql = sql[0, 2000] + "…" if sql.length > 2000
       data = { "db.duration_ms" => (duration * 1000).round(3) }
       data["db.name"] = payload[:name].to_s if payload[:name]
+      # The Queries watcher's default (aggregate) view groups by db.statement_fingerprint and skips
+      # spans without one, so always provide a normalized fingerprint.
+      data["db.statement_fingerprint"] = sql_fingerprint(payload[:sql].to_s)
 
       t["spans"] << {
         "span_id" => SecureRandom.hex(8),
@@ -973,6 +1036,120 @@ module LookoutFramework
         "status" => "ok",
         "data" => data
       }
+    end
+
+    # Append a cache.* child span (Cache watcher). result is hit/miss/ok; hit is the bool the miss
+    # stat keys off (nil for writes/deletes).
+    def record_cache_span(op, qstart, qfinish, payload, result, hit)
+      t = trace
+      return if t.nil? || t["spans"].size >= trace_max_spans
+
+      duration = span_duration(qstart, qfinish)
+      ended = Time.now.to_f
+      data = { "cache.result" => result, "cache.duration_ms" => (duration * 1000).round(3) }
+      data["cache.hit"] = !!hit unless hit.nil?
+      data["cache.key"] = payload[:key].to_s[0, 200] if payload[:key]
+      data["cache.store"] = payload[:store].to_s if payload[:store]
+      t["spans"] << {
+        "span_id" => SecureRandom.hex(8),
+        "parent_span_id" => t["root_id"],
+        "op" => op,
+        "description" => "#{op} #{payload[:key]}".strip[0, 512],
+        "start_timestamp" => ended - duration,
+        "end_timestamp" => ended,
+        "status" => "ok",
+        "data" => data
+      }
+    end
+
+    # Append an http.client child span (HTTP Client watcher) for an outbound Net::HTTP request.
+    # Skips calls to our own ingest host so the SDK never traces itself.
+    def record_http_span(http, request, response, started_mono, error = nil)
+      t = trace
+      return if t.nil? || t["spans"].size >= trace_max_spans
+
+      host = http.address.to_s
+      return if host.empty? || host == ingest_host
+
+      duration = [Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_mono, 0.0].max
+      ended = Time.now.to_f
+      scheme = http.respond_to?(:use_ssl?) && http.use_ssl? ? "https" : "http"
+      method = request.respond_to?(:method) ? request.method.to_s : "GET"
+      path = request.respond_to?(:path) ? request.path.to_s : "/"
+      status = response.respond_to?(:code) ? response.code.to_i : nil
+      data = { "server.address" => host[0, 255] }
+      data["http.status_code"] = status if status&.positive?
+      data["error"] = error.message.to_s[0, 500] if error
+      t["spans"] << {
+        "span_id" => SecureRandom.hex(8),
+        "parent_span_id" => t["root_id"],
+        "op" => "http.client",
+        "description" => "#{method} #{scheme}://#{host}#{path}"[0, 512],
+        "start_timestamp" => ended - duration,
+        "end_timestamp" => ended,
+        "status" => (error || (status && status >= 500)) ? "internal_error" : "ok",
+        "data" => data
+      }
+    end
+
+    # Append a db.redis child span (Redis watcher) for a redis-client command.
+    def record_redis_span(command, started_mono)
+      t = trace
+      return if t.nil? || t["spans"].size >= trace_max_spans
+
+      duration = [Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_mono, 0.0].max
+      ended = Time.now.to_f
+      verb = Array(command).first.to_s.upcase[0, 64]
+      t["spans"] << {
+        "span_id" => SecureRandom.hex(8),
+        "parent_span_id" => t["root_id"],
+        "op" => "db.redis",
+        "description" => verb,
+        "start_timestamp" => ended - duration,
+        "end_timestamp" => ended,
+        "status" => "ok",
+        "data" => { "db.system" => "redis", "db.duration_ms" => (duration * 1000).round(3) }
+      }
+    end
+
+    def span_duration(qstart, qfinish)
+      d = (qfinish - qstart).to_f
+      d.negative? ? 0.0 : d
+    rescue StandardError
+      0.0
+    end
+
+    # Host of the Lookout ingest base_uri, so HTTP instrumentation can skip the SDK's own calls.
+    def ingest_host
+      @ingest_host ||= (URI.parse(base_uri).host.to_s if base_uri.to_s != "")
+    rescue StandardError
+      nil
+    end
+
+    def instrument_http!
+      require "net/http"
+      Net::HTTP.prepend(HttpInstrumentation) unless Net::HTTP.ancestors.include?(HttpInstrumentation)
+    rescue StandardError
+      nil
+    end
+
+    def instrument_redis!
+      return unless defined?(RedisClient) && RedisClient.respond_to?(:register)
+
+      RedisClient.register(RedisInstrumentation)
+    rescue StandardError
+      nil
+    end
+
+    # Normalize a SQL statement into a stable grouping key for the Queries watcher: collapse
+    # whitespace, mask string literals and numbers, and fold repeated bind placeholders.
+    def sql_fingerprint(sql)
+      s = sql.to_s.gsub(/\s+/, " ").strip
+      s = s.gsub(/'(?:[^']|'')*'/, "?")        # single-quoted string literals (keep "identifiers")
+      s = s.gsub(/\b\d+\.\d+\b/, "?")          # floats
+      s = s.gsub(/\b\d+\b/, "?")               # integers
+      s = s.gsub(/\?(?:\s*,\s*\?)+/, "?")      # collapse "?, ?, ?" lists
+      s[0, 512]
     end
 
     def forward_rails_log?

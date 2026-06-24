@@ -28,6 +28,8 @@ Copy-paste **Ruby on Rails** instrumentation (not a published gem) that mirrors 
 | `LOOKOUT_INSTRUMENT_SQL` | `1` to record sampled `sql.active_record` breadcrumbs |
 | `LOOKOUT_PERFORMANCE_ENABLED` | `1` to capture HTTP **request traces** (env > site; force-accepts via `X-Lookout-Env-Forced`). Unset = follow the dashboard |
 | `LOOKOUT_TRACE_MAX_SPANS` | Cap on child spans per request trace (default `190`, server allows 200 incl. root) |
+| `LOOKOUT_INSTRUMENT_HTTP` | `1` to capture outbound `Net::HTTP` calls as `http.client` spans → HTTP Client watcher (skips the SDK's own ingest calls) |
+| `LOOKOUT_INSTRUMENT_REDIS` | `1` to capture `redis-client` commands as `db.redis` spans → Redis watcher (requires the `redis-client` gem) |
 | `LOOKOUT_JOBS_ENABLED` | `1` to send **Active Job** runs to the Queues watcher (env > site; force-accepts via `X-Lookout-Env-Forced`). Unset = follow the dashboard |
 | `LOOKOUT_LOGS_ENABLED` | `1` to forward **log** records to the Logs watcher (env > site; force-accepts via `X-Lookout-Env-Forced`). Unset = follow the dashboard |
 | `LOOKOUT_FORWARD_RAILS_LOG` | `1` to auto-mirror `Rails.logger` output into the Logs watcher |
@@ -54,6 +56,8 @@ Errors are always sent. **Dumps** (`LookoutFramework.dump(value)`) are gated by 
 ### Request traces (Requests / performance)
 
 Set `LOOKOUT_PERFORMANCE_ENABLED=1` (or turn the **traces** signal on in the dashboard) and every controller request is captured as a trace: a root **`http.server`** span (`description: "GET /path"`, `data`: `http.method`, `http.route` = `Controller#action`, `http.status_code`, `db.query_count`) plus one **`db.query`** child span per executed SQL statement (cached reads skipped). These power the **Requests** tab. Traces are built in a request-scoped, thread-local buffer and **posted off-thread** to `POST /api/ingest/trace` so they add no latency to the response — byte-compatible with the Laravel `lookout/tracing` payload (32-hex `trace_id`, 16-hex `span_id`, epoch-second timestamps).
+
+The **Queries**, **Cache**, **Redis**, and **HTTP Client** watchers are all derived from these trace spans (no separate signal): SQL `sql.active_record` queries become `db.query` child spans (with a `db.statement_fingerprint` so the Queries aggregate view groups them), `Rails.cache` reads/writes/deletes become `cache.*` spans, and — when opted in — outbound `Net::HTTP` calls become `http.client` spans and `redis-client` commands become `db.redis` spans. They all ride the same trace pipeline, so enabling performance fills those tabs too.
 
 Performance ingest is **opt-in on the server** (`projects.performance_ingest_enabled` defaults off), so unlike errors/dumps it defaults OFF here; enabling via env sends `X-Lookout-Env-Forced` so the server accepts it regardless of the dashboard toggle. SQL child spans require `LOOKOUT_PERFORMANCE_ENABLED` (or the dashboard signal) to be on **at boot**.
 
