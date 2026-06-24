@@ -33,6 +33,16 @@ Copy-paste **Ruby on Rails** instrumentation (not a published gem) that mirrors 
 | `LOOKOUT_FORWARD_RAILS_LOG` | `1` to auto-mirror `Rails.logger` output into the Logs watcher |
 | `LOOKOUT_FORWARD_RAILS_LOG_LEVEL` | Min level the auto-forwarder captures (default `warn`; avoids flooding with dev info/SQL) |
 | `LOOKOUT_LOGS_MAX_BUFFER` | Flush the log buffer at this many entries (default `50`, server caps a batch at `200`) |
+| `LOOKOUT_MAIL_ENABLED` | `1` to report delivered mail (ActionMailer) → Mail watcher |
+| `LOOKOUT_MODELS_ENABLED` | `1` to report ActiveRecord create/update/destroy → Models watcher |
+| `LOOKOUT_EVENTS_ENABLED` | `1` to send `LookoutFramework.event(...)` → Events watcher |
+| `LOOKOUT_GATES_ENABLED` | `1` to send `LookoutFramework.gate(...)` → Gates watcher |
+| `LOOKOUT_METRICS_ENABLED` | `1` to send `LookoutFramework.metric/gauge/count/distribution(...)` → Metrics watcher |
+| `LOOKOUT_BATCHES_ENABLED` | `1` to send `LookoutFramework.batch(...)` → Batches watcher |
+| `LOOKOUT_CRON_ENABLED` | `1` to send `LookoutFramework.cron(slug){…}` check-ins → Cron watcher |
+| `LOOKOUT_FEEDBACK_ENABLED` | `1` to send `LookoutFramework.user_feedback(...)` → User Feedback watcher |
+
+(Each `*_ENABLED` is env > site: set it to force the signal on — the SDK sends `X-Lookout-Env-Forced` — or leave it unset to follow the dashboard.)
 | `LOOKOUT_REMOTE_CONFIG` | `0` to disable fetching per-project config from the dashboard (default on) |
 | `LOOKOUT_REMOTE_CONFIG_TTL` | Seconds to cache the fetched config in-process (default `300`) |
 | `LOOKOUT_DUMPS_ENABLED` | Local override for the **dumps** signal (env > site); unset = follow the dashboard |
@@ -46,6 +56,23 @@ Errors are always sent. **Dumps** (`LookoutFramework.dump(value)`) are gated by 
 Set `LOOKOUT_PERFORMANCE_ENABLED=1` (or turn the **traces** signal on in the dashboard) and every controller request is captured as a trace: a root **`http.server`** span (`description: "GET /path"`, `data`: `http.method`, `http.route` = `Controller#action`, `http.status_code`, `db.query_count`) plus one **`db.query`** child span per executed SQL statement (cached reads skipped). These power the **Requests** tab. Traces are built in a request-scoped, thread-local buffer and **posted off-thread** to `POST /api/ingest/trace` so they add no latency to the response — byte-compatible with the Laravel `lookout/tracing` payload (32-hex `trace_id`, 16-hex `span_id`, epoch-second timestamps).
 
 Performance ingest is **opt-in on the server** (`projects.performance_ingest_enabled` defaults off), so unlike errors/dumps it defaults OFF here; enabling via env sends `X-Lookout-Env-Forced` so the server accepts it regardless of the dashboard toggle. SQL child spans require `LOOKOUT_PERFORMANCE_ENABLED` (or the dashboard signal) to be on **at boot**.
+
+### Mail, Models, Events, Gates, Metrics, Batches, Cron, User Feedback
+
+These map to the matching monitoring tabs. **Mail** (`deliver.action_mailer`) and **Models** (ActiveRecord `after_create`/`after_update`/`after_destroy`, mixed into `ActiveRecord::Base`) are automatic once enabled. The rest are explicit calls — Rails has no native gate/metric/batch/cron concept:
+
+```ruby
+LookoutFramework.event("App::Events::OrderPlaced", listeners: 2, broadcast: true, meta: { order_id: 42 })
+LookoutFramework.gate("update_post", allowed: policy.update?, user: current_user&.id, target: "Post")
+LookoutFramework.gauge("queue.depth", 12, unit: "1")
+LookoutFramework.count("orders.completed", 1, attributes: { region: "us" })
+LookoutFramework.distribution("request.latency_ms", 42.5, unit: "ms")
+LookoutFramework.batch("import-#{id}", total_jobs: 100, pending_jobs: 40, failed_jobs: 1) # upserts by batch_id
+LookoutFramework.cron("nightly-report") { run_report }   # two-phase check-in around the block
+LookoutFramework.user_feedback(comments: msg, event_id: error_id, name:, email:)
+```
+
+Events/Models/Gates/Metrics are **buffered and batched** (`{entries:[…]}`, flushed at request/job/command end + process exit); Mail/Batches/Feedback post per call (off-thread); Cron posts synchronously (two-phase `in_progress`→`ok`/`error`, server keys check-ins by id). All share the env-forced/dashboard gating above. Metric `kind` is `counter|gauge|distribution`; non-finite values are dropped. Model tracking is decided at boot — enable the signal before boot to capture the `ActiveRecord` callbacks.
 
 ### Logs
 
@@ -84,6 +111,7 @@ Set `LOOKOUT_JOBS_ENABLED=1` (or turn the **jobs** signal on in the dashboard) a
 - **Request traces** — root `http.server` span + `db.query` children → **Requests** tab (opt-in, see above)
 - **CLI / rake commands** — `LookoutFramework.command(name) { … }` → root `console.command` span → **Commands** tab (opt-in, see above)
 - **Logs** — `LookoutFramework.log(level, message, attrs)` (+ optional `Rails.logger` forwarder) → **Logs** tab (opt-in, see above)
+- **Mail / Models / Events / Gates / Metrics / Batches / Cron / User Feedback** — see the section above (opt-in)
 - **Active Job runs** — `in_progress` → `ok`/`error` per execution → **Queues** tab (opt-in, see above)
 - **Action Controller** — `process_action.action_controller` (controller#action, status, path)
 - **Active Job** — `perform_start.active_job`, `perform.active_job`, `enqueue.active_job`, `discard.active_job`, `retry_stopped.active_job`

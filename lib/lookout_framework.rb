@@ -260,6 +260,15 @@ module LookoutFramework
     end
   end
 
+  # Mixed into ActiveRecord::Base so create/update/destroy feed the Models watcher.
+  module ModelTracking
+    def self.included(base)
+      base.after_create  { LookoutFramework.send(:record_model_change, self, "created") }
+      base.after_update  { LookoutFramework.send(:record_model_change, self, "updated") }
+      base.after_destroy { LookoutFramework.send(:record_model_change, self, "deleted") }
+    end
+  end
+
   class << self
     attr_writer :api_key, :base_uri, :ingest_path
 
@@ -290,6 +299,23 @@ module LookoutFramework
     def log_ingest_path
       @log_ingest_path ||= ENV.fetch("LOOKOUT_LOG_INGEST_PATH", "/api/ingest/log")
     end
+
+    def mail_ingest_path
+      @mail_ingest_path ||= ENV.fetch("LOOKOUT_MAIL_INGEST_PATH", "/api/ingest/mail")
+    end
+
+    def batch_ingest_path
+      @batch_ingest_path ||= ENV.fetch("LOOKOUT_BATCH_INGEST_PATH", "/api/ingest/batch")
+    end
+
+    # Buffered batch signals share one transport (POST {path} {entries:[...]}). Each maps to its
+    # ingest path, its LOOKOUT_<X>_ENABLED env override, and its GET /api/config signal key.
+    BATCH_SIGNALS = {
+      "models" => { path: "/api/ingest/model", env: "LOOKOUT_MODELS_ENABLED", key: "models" },
+      "events" => { path: "/api/ingest/event", env: "LOOKOUT_EVENTS_ENABLED", key: "events" },
+      "gates" => { path: "/api/ingest/gate", env: "LOOKOUT_GATES_ENABLED", key: "gates" },
+      "metrics" => { path: "/api/ingest/metric", env: "LOOKOUT_METRICS_ENABLED", key: "metrics" }
+    }.freeze
 
     # Flush the log buffer once it reaches this many entries (server caps a batch at 200).
     def logs_max_buffer
@@ -394,6 +420,22 @@ module LookoutFramework
       !!remote_config.dig("signals", "logs", "enabled")
     end
 
+    # Explicit env override for the mail signal, or nil when unset (env > site).
+    def mail_env_override
+      raw = ENV["LOOKOUT_MAIL_ENABLED"]
+      return nil if raw.nil? || raw.to_s.strip.empty?
+
+      %w[1 true yes on].include?(raw.to_s.strip.downcase)
+    end
+
+    # Whether to report sent mail (ActionMailer) to the Mail watcher. Opt-in (defaults OFF).
+    def mail_enabled?
+      override = mail_env_override
+      return override unless override.nil?
+
+      !!remote_config.dig("signals", "mail", "enabled")
+    end
+
     # Cached per-project ingest config from GET /api/config. Cached in-process for remote_config_ttl
     # seconds (this runs in a long-lived Rails process); refreshed lazily when stale.
     def remote_config
@@ -472,6 +514,7 @@ module LookoutFramework
         report_http_not_found(payload) if status.to_i == 404
         finish_trace!(payload, finish) if trace
         flush_logs!(async: true)
+        flush_all_signals!(async: true)
       end
 
       ActiveSupport::Notifications.subscribe("perform_start.active_job") do |_name, _start, _finish, _id, payload|
@@ -496,6 +539,7 @@ module LookoutFramework
         store.add(type: "queue", category: "job", level: "info", message: "perform.active_job: #{jname}")
         finish_job_run!(payload) if job && job_runs.key?(job_run_key(job))
         flush_logs!
+        flush_all_signals!
       end
 
       %w[enqueue.active_job discard.active_job retry_stopped.active_job].each do |ev|
@@ -506,8 +550,23 @@ module LookoutFramework
         end
       end
 
-      # Drain any buffered logs when the process exits (covers short-lived CLI/rake runs).
-      at_exit { flush_logs! }
+      # ActionMailer → Mail watcher (one record per delivered message).
+      ActiveSupport::Notifications.subscribe("deliver.action_mailer") do |_name, _start, _finish, _id, payload|
+        report_mail(payload) if mail_enabled?
+      end
+
+      # ActiveRecord create/update/destroy → Models watcher (buffered, batched).
+      if signal_on?("models") && defined?(ActiveSupport)
+        ActiveSupport.on_load(:active_record) do
+          include LookoutFramework::ModelTracking
+        end
+      end
+
+      # Drain any buffered signals when the process exits (covers short-lived CLI/rake runs).
+      at_exit do
+        flush_logs!
+        flush_all_signals!
+      end
 
       # Opt-in: mirror Rails.logger output to the Logs watcher (LOOKOUT_FORWARD_RAILS_LOG=1).
       attach_log_forwarder! if forward_rails_log?
@@ -678,6 +737,7 @@ module LookoutFramework
       ensure
         finish_command_trace!(exit_code)
         flush_logs!
+        flush_all_signals!
       end
     end
 
@@ -734,6 +794,122 @@ module LookoutFramework
       async ? Thread.new { poster.call } : poster.call
       nil
     rescue StandardError
+      nil
+    end
+
+    # Record a custom domain event → Events watcher.
+    def event(name, listeners: nil, broadcast: false, meta: nil)
+      return unless signal_on?("events")
+
+      entry = { "event" => name.to_s[0, 512], "broadcast" => !!broadcast, "dispatched_at" => Time.now.utc.iso8601 }
+      entry["listeners"] = [[listeners.to_i, 0].max, 65_535].min unless listeners.nil?
+      entry["meta"] = stringify_keys(meta) if meta.is_a?(Hash) && meta.any?
+      enqueue_signal("events", with_common(entry))
+      nil
+    end
+
+    # Record an authorization gate / feature-flag check → Gates watcher. Returns `allowed`.
+    def gate(ability, allowed:, user: nil, target: nil, meta: nil)
+      return allowed unless signal_on?("gates")
+
+      entry = { "ability" => ability.to_s[0, 255], "result" => (allowed ? "allowed" : "denied"), "occurred_at" => Time.now.utc.iso8601 }
+      entry["target"] = target.to_s[0, 512] unless target.nil?
+      entry["user"] = user.to_s[0, 64] unless user.nil?
+      entry["meta"] = stringify_keys(meta) if meta.is_a?(Hash) && meta.any?
+      enqueue_signal("gates", with_common(entry))
+      allowed
+    end
+
+    # Record a custom metric sample → Metrics watcher. kind: counter | gauge | distribution.
+    def metric(name, value, kind: "gauge", unit: nil, attributes: nil)
+      return value unless signal_on?("metrics")
+      return value unless value.respond_to?(:to_f) && value.to_f.finite?
+
+      entry = { "name" => name.to_s[0, 128], "kind" => normalize_metric_kind(kind), "value" => value.to_f, "timestamp" => Time.now.to_f }
+      entry["unit"] = unit.to_s[0, 32] unless unit.nil?
+      entry["attributes"] = stringify_keys(attributes) if attributes.is_a?(Hash) && attributes.any?
+      enqueue_signal("metrics", with_common(entry))
+      value
+    end
+
+    def count(name, delta = 1, unit: nil, attributes: nil)
+      metric(name, delta, kind: "counter", unit: unit, attributes: attributes)
+    end
+
+    def gauge(name, value, unit: nil, attributes: nil)
+      metric(name, value, kind: "gauge", unit: unit, attributes: attributes)
+    end
+
+    def distribution(name, value, unit: nil, attributes: nil)
+      metric(name, value, kind: "distribution", unit: unit, attributes: attributes)
+    end
+
+    # Upsert job-batch progress → Batches watcher (server keys by batch_id; send the same id as it
+    # progresses). Status/progress are derived server-side from the job counts + finished/cancelled.
+    def batch(batch_id, name: nil, total_jobs: nil, pending_jobs: nil, failed_jobs: nil, status: nil, finished_at: nil, cancelled_at: nil, meta: nil)
+      return if batch_id.to_s.empty?
+      return unless batches_enabled?
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      entry = { "batch_id" => batch_id.to_s[0, 64] }
+      entry["name"] = name.to_s[0, 255] unless name.nil?
+      entry["total_jobs"] = total_jobs.to_i unless total_jobs.nil?
+      entry["pending_jobs"] = pending_jobs.to_i unless pending_jobs.nil?
+      entry["failed_jobs"] = failed_jobs.to_i unless failed_jobs.nil?
+      entry["status"] = status.to_s unless status.nil?
+      entry["finished_at"] = iso_time(finished_at) unless finished_at.nil?
+      entry["cancelled_at"] = iso_time(cancelled_at) unless cancelled_at.nil?
+      entry["meta"] = stringify_keys(meta) if meta.is_a?(Hash) && meta.any?
+      with_common(entry)
+      forced = env_flag("LOOKOUT_BATCHES_ENABLED") == true
+      Thread.new do
+        post_to(batch_ingest_path, entry, env_forced: forced)
+      rescue StandardError
+        nil
+      end
+      nil
+    end
+
+    # Monitor a scheduled task → Cron watcher. Two-phase check-in (in_progress → ok/error) around the
+    # block, posted synchronously. Re-raises so the task still fails.
+    def cron(slug, &block)
+      active = cron_enabled? && !api_key.to_s.empty? && !base_uri.to_s.empty?
+      return (block ? block.call : nil) unless active
+
+      check_in_id = SecureRandom.uuid
+      started = Time.now.to_f
+      post_cron(slug, "in_progress", check_in_id)
+      begin
+        result = block ? block.call : nil
+        post_cron(slug, "ok", check_in_id, Time.now.to_f - started)
+        result
+      rescue Exception # rubocop:disable Lint/RescueException -- record failure then re-raise
+        post_cron(slug, "error", check_in_id, Time.now.to_f - started)
+        raise
+      end
+    end
+
+    # Attach user feedback to an error occurrence → User Feedback watcher. Pass the occurrence_uuid or
+    # error event_id the feedback is about (one of them is required by the server).
+    def user_feedback(comments:, occurrence_uuid: nil, event_id: nil, name: nil, email: nil)
+      return if comments.to_s.strip.empty?
+      return unless feedback_enabled?
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      body = { "comments" => comments.to_s[0, 10_000] }
+      if !occurrence_uuid.to_s.empty?
+        body["occurrence_uuid"] = occurrence_uuid.to_s
+      elsif !event_id.to_s.empty?
+        body["event_id"] = event_id.to_s
+      end
+      body["name"] = name.to_s[0, 128] unless name.nil?
+      body["email"] = email.to_s[0, 255] unless email.nil?
+      forced = env_flag("LOOKOUT_FEEDBACK_ENABLED") == true
+      Thread.new do
+        post_to(feedback_ingest_path, body, env_forced: forced)
+      rescue StandardError
+        nil
+      end
       nil
     end
 
@@ -862,6 +1038,176 @@ module LookoutFramework
         end
       end
       out.empty? ? nil : out
+    end
+
+    # --- Generic signal gating + buffered batch transport (models/events/gates/metrics) ---------
+
+    # Parse a boolean-ish env var to true/false, or nil when unset.
+    def env_flag(name)
+      raw = ENV[name]
+      return nil if raw.nil? || raw.to_s.strip.empty?
+
+      %w[1 true yes on].include?(raw.to_s.strip.downcase)
+    end
+
+    # env override (env > site) else the dashboard remote-config signal.
+    def signal_enabled?(env_name, config_key)
+      override = env_flag(env_name)
+      return override unless override.nil?
+
+      !!remote_config.dig("signals", config_key, "enabled")
+    end
+
+    def signal_on?(name)
+      spec = BATCH_SIGNALS[name]
+      spec && signal_enabled?(spec[:env], spec[:key])
+    end
+
+    def cron_enabled?
+      signal_enabled?("LOOKOUT_CRON_ENABLED", "crons")
+    end
+
+    def batches_enabled?
+      signal_enabled?("LOOKOUT_BATCHES_ENABLED", "batches")
+    end
+
+    def feedback_enabled?
+      signal_enabled?("LOOKOUT_FEEDBACK_ENABLED", "feedback")
+    end
+
+    def cron_ingest_path
+      @cron_ingest_path ||= ENV.fetch("LOOKOUT_CRON_INGEST_PATH", "/api/ingest/cron")
+    end
+
+    def feedback_ingest_path
+      @feedback_ingest_path ||= ENV.fetch("LOOKOUT_FEEDBACK_INGEST_PATH", "/api/ingest/feedback")
+    end
+
+    def signal_buffers
+      @signal_buffers ||= {}
+    end
+
+    def signals_mutex
+      @signals_mutex ||= Mutex.new
+    end
+
+    # Attach the fields every signal shares: environment + the active request/command trace_id.
+    def with_common(entry)
+      entry["environment"] = environment unless environment.to_s.empty?
+      active = trace
+      entry["trace_id"] = active["trace_id"] if active && active["trace_id"]
+      entry
+    end
+
+    def enqueue_signal(name, entry)
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      size = nil
+      signals_mutex.synchronize do
+        (signal_buffers[name] ||= []) << entry
+        size = signal_buffers[name].size
+      end
+      flush_signal(name, async: true) if size >= 100
+    rescue StandardError
+      nil
+    end
+
+    def flush_signal(name, async: false)
+      spec = BATCH_SIGNALS[name]
+      return unless spec
+
+      batch = nil
+      signals_mutex.synchronize do
+        buf = signal_buffers[name]
+        return if buf.nil? || buf.empty?
+
+        batch = buf.slice!(0, buf.length)
+      end
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      forced = env_flag(spec[:env]) == true
+      poster = lambda do
+        batch.each_slice(100) do |chunk|
+          post_to(spec[:path], { "entries" => chunk }, env_forced: forced)
+        rescue StandardError
+          nil
+        end
+      end
+      async ? Thread.new { poster.call } : poster.call
+    rescue StandardError
+      nil
+    end
+
+    def flush_all_signals!(async: false)
+      BATCH_SIGNALS.each_key { |name| flush_signal(name, async: async) }
+    end
+
+    # Build + buffer a Models-watcher entry for an ActiveRecord create/update/destroy.
+    def record_model_change(model, action)
+      return unless signal_on?("models")
+
+      name = model.class.name.to_s
+      return if name.empty? || name.start_with?("ActiveRecord::", "ActiveStorage::")
+
+      entry = { "model" => name[0, 512], "change" => action, "occurred_at" => Time.now.utc.iso8601 }
+      entry["key"] = model.id.to_s[0, 64] if model.respond_to?(:id) && !model.id.nil?
+      if action == "updated" && model.respond_to?(:saved_changes)
+        changed = (model.saved_changes.keys - %w[created_at updated_at]).first(32).map { |k| k.to_s[0, 128] }
+        entry["changes"] = changed unless changed.empty?
+      end
+      enqueue_signal("models", with_common(entry))
+    rescue StandardError
+      nil
+    end
+
+    # Build + post a Mail-watcher record from a deliver.action_mailer payload (off-thread).
+    def report_mail(payload)
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      entry = { "mailable" => (payload[:mailer] || "ActionMailer").to_s[0, 512], "meta" => { "status" => "sent" } }
+      entry["subject"] = payload[:subject].to_s[0, 512] unless payload[:subject].nil?
+      recipients = Array(payload[:to]).map { |addr| addr.to_s[0, 320] }.reject(&:empty?).first(20)
+      entry["to"] = recipients unless recipients.empty?
+      entry["sent_at"] = iso_time(payload[:date]) || Time.now.utc.iso8601
+      with_common(entry)
+      forced = mail_env_override == true
+      Thread.new do
+        post_to(mail_ingest_path, entry, env_forced: forced)
+      rescue StandardError
+        nil
+      end
+    rescue StandardError
+      nil
+    end
+
+    # Post a single cron check-in synchronously (CLI processes exit promptly; two-phase ordering).
+    def post_cron(slug, status, check_in_id, duration = nil)
+      body = { "slug" => slug.to_s[0, 128], "status" => status, "check_in_id" => check_in_id }
+      body["duration"] = duration.round(3) if duration && duration >= 0
+      body["environment"] = environment unless environment.to_s.empty?
+      post_to(cron_ingest_path, body, env_forced: env_flag("LOOKOUT_CRON_ENABLED") == true)
+    rescue StandardError
+      nil
+    end
+
+    def normalize_metric_kind(kind)
+      k = kind.to_s.strip.downcase
+      %w[counter gauge distribution].include?(k) ? k : "gauge"
+    end
+
+    # The server expects string-keyed attribute/meta objects; user hashes may use symbols.
+    def stringify_keys(hash)
+      hash.each_with_object({}) { |(k, v), out| out[k.to_s] = v }
+    end
+
+    # Coerce a Time/Date/ISO-string to an ISO8601 UTC string, or nil.
+    def iso_time(value)
+      return nil if value.nil?
+      return value.utc.iso8601 if value.respond_to?(:utc)
+
+      Time.parse(value.to_s).utc.iso8601
+    rescue StandardError
+      nil
     end
 
     # Per-thread map of in-flight job runs, keyed by job id, holding the client-generated run_id and
@@ -1107,6 +1453,15 @@ module LookoutFramework
       overrides["jobs"] = { "enabled" => jobs } unless jobs.nil?
       logs = logs_env_override
       overrides["logs"] = { "enabled" => logs } unless logs.nil?
+      {
+        "mail" => "LOOKOUT_MAIL_ENABLED", "models" => "LOOKOUT_MODELS_ENABLED",
+        "events" => "LOOKOUT_EVENTS_ENABLED", "gates" => "LOOKOUT_GATES_ENABLED",
+        "metrics" => "LOOKOUT_METRICS_ENABLED", "crons" => "LOOKOUT_CRON_ENABLED",
+        "batches" => "LOOKOUT_BATCHES_ENABLED", "feedback" => "LOOKOUT_FEEDBACK_ENABLED"
+      }.each do |key, env_name|
+        flag = env_flag(env_name)
+        overrides[key] = { "enabled" => flag } unless flag.nil?
+      end
       return nil if overrides.empty?
 
       Base64.strict_encode64(JSON.generate(overrides))
