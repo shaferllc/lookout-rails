@@ -4,6 +4,7 @@
 # See packages/lookout-rails/README.md
 
 require "base64"
+require "digest"
 require "json"
 require "net/http"
 require "uri"
@@ -300,6 +301,35 @@ module LookoutFramework
       @remote_config = fetch_remote_config || @remote_config || {}
     end
 
+    # Client suppression key for an error: stable 32-char id from the exception class + a normalized
+    # message. When a user ignores an error group in the dashboard the server publishes that group's
+    # key in GET /api/config ("suppress"); we drop matches before sending so ignored errors stop
+    # re-ingesting. This recipe is a CONTRACT shared byte-for-byte with the server
+    # (App\Support\ErrorSuppressionKey) and the other SDKs — keep it identical or bump "lkt_supp_v1".
+    def suppression_key(exception_class, message)
+      klass = exception_class.to_s.strip.downcase
+      Digest::SHA256.hexdigest("lkt_supp_v1|#{klass}|#{normalize_suppression_message(message)}")[0, 32]
+    end
+
+    # Lowercase, collapse whitespace, mask volatile tokens (UUIDs, long id/hash runs, numbers).
+    def normalize_suppression_message(message)
+      s = message.to_s.strip.downcase
+      s = s.gsub(/\s+/, " ")
+      s = s.gsub(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/, "<id>")
+      s = s.gsub(/[0-9a-z]{12,}/, "<id>")
+      s = s.gsub(/\b0x[0-9a-f]+\b/, "<n>")
+      s = s.gsub(/\d+/, "<n>")
+      (s.strip[0, 200] || "")
+    end
+
+    # Whether the dashboard has ignored this error (its suppression key is in the remote-config list).
+    def error_suppressed?(exception_class, message)
+      keys = remote_config["suppress"]
+      return false unless keys.is_a?(Array) && !keys.empty?
+
+      keys.include?(suppression_key(exception_class, message))
+    end
+
     def install!
       return if defined?(@@lookout_installed) && @@lookout_installed
 
@@ -383,6 +413,8 @@ module LookoutFramework
       msg = exception.message.to_s
       msg = exception.class.name if msg.empty?
 
+      return if error_suppressed?(exception.class.name, msg)
+
       body = {
         "api_key" => api_key,
         "message" => msg,
@@ -437,6 +469,8 @@ module LookoutFramework
           }
         )
       }
+
+      return if error_suppressed?(body["exception_class"], body["message"])
 
       post_ingest(body)
     rescue StandardError
