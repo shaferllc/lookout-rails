@@ -29,6 +29,10 @@ Copy-paste **Ruby on Rails** instrumentation (not a published gem) that mirrors 
 | `LOOKOUT_PERFORMANCE_ENABLED` | `1` to capture HTTP **request traces** (env > site; force-accepts via `X-Lookout-Env-Forced`). Unset = follow the dashboard |
 | `LOOKOUT_TRACE_MAX_SPANS` | Cap on child spans per request trace (default `190`, server allows 200 incl. root) |
 | `LOOKOUT_JOBS_ENABLED` | `1` to send **Active Job** runs to the Queues watcher (env > site; force-accepts via `X-Lookout-Env-Forced`). Unset = follow the dashboard |
+| `LOOKOUT_LOGS_ENABLED` | `1` to forward **log** records to the Logs watcher (env > site; force-accepts via `X-Lookout-Env-Forced`). Unset = follow the dashboard |
+| `LOOKOUT_FORWARD_RAILS_LOG` | `1` to auto-mirror `Rails.logger` output into the Logs watcher |
+| `LOOKOUT_FORWARD_RAILS_LOG_LEVEL` | Min level the auto-forwarder captures (default `warn`; avoids flooding with dev info/SQL) |
+| `LOOKOUT_LOGS_MAX_BUFFER` | Flush the log buffer at this many entries (default `50`, server caps a batch at `200`) |
 | `LOOKOUT_REMOTE_CONFIG` | `0` to disable fetching per-project config from the dashboard (default on) |
 | `LOOKOUT_REMOTE_CONFIG_TTL` | Seconds to cache the fetched config in-process (default `300`) |
 | `LOOKOUT_DUMPS_ENABLED` | Local override for the **dumps** signal (env > site); unset = follow the dashboard |
@@ -42,6 +46,18 @@ Errors are always sent. **Dumps** (`LookoutFramework.dump(value)`) are gated by 
 Set `LOOKOUT_PERFORMANCE_ENABLED=1` (or turn the **traces** signal on in the dashboard) and every controller request is captured as a trace: a root **`http.server`** span (`description: "GET /path"`, `data`: `http.method`, `http.route` = `Controller#action`, `http.status_code`, `db.query_count`) plus one **`db.query`** child span per executed SQL statement (cached reads skipped). These power the **Requests** tab. Traces are built in a request-scoped, thread-local buffer and **posted off-thread** to `POST /api/ingest/trace` so they add no latency to the response — byte-compatible with the Laravel `lookout/tracing` payload (32-hex `trace_id`, 16-hex `span_id`, epoch-second timestamps).
 
 Performance ingest is **opt-in on the server** (`projects.performance_ingest_enabled` defaults off), so unlike errors/dumps it defaults OFF here; enabling via env sends `X-Lookout-Env-Forced` so the server accepts it regardless of the dashboard toggle. SQL child spans require `LOOKOUT_PERFORMANCE_ENABLED` (or the dashboard signal) to be on **at boot**.
+
+### Logs
+
+Set `LOOKOUT_LOGS_ENABLED=1` (or the dashboard **logs** signal) and forward structured log records to the Logs watcher:
+
+```ruby
+LookoutFramework.log(:warn, "Payment retry scheduled", attempt: 2, order_id: 17)
+```
+
+Records are **buffered** and posted in batches to `POST /api/ingest/log` (`{ "entries": [...] }`, ≤200/batch) — flushed at the end of each request/job/command, when the buffer fills (`LOOKOUT_LOGS_MAX_BUFFER`, default 50), and at process exit (so short rake runs still ship). Each entry carries `level` (normalized — `warning`→`warn`, `critical`/`alert`/`emergency`→`fatal`), `message`, `source: "ruby"`, `logger`, an epoch-float `timestamp`, the active request/command `trace_id`, and an `attributes` hash (scalars kept, nested values JSON-encoded). Web flushes are off-thread; CLI/job flushes are synchronous.
+
+To mirror existing `Rails.logger` output automatically, set `LOOKOUT_FORWARD_RAILS_LOG=1` — it attaches to the broadcast logger and forwards records at/above `LOOKOUT_FORWARD_RAILS_LOG_LEVEL` (default `warn`, with a re-entrancy guard so the SDK's own work can't loop).
 
 ### CLI / rake commands (Commands)
 
@@ -67,6 +83,7 @@ Set `LOOKOUT_JOBS_ENABLED=1` (or turn the **jobs** signal on in the dashboard) a
 
 - **Request traces** — root `http.server` span + `db.query` children → **Requests** tab (opt-in, see above)
 - **CLI / rake commands** — `LookoutFramework.command(name) { … }` → root `console.command` span → **Commands** tab (opt-in, see above)
+- **Logs** — `LookoutFramework.log(level, message, attrs)` (+ optional `Rails.logger` forwarder) → **Logs** tab (opt-in, see above)
 - **Active Job runs** — `in_progress` → `ok`/`error` per execution → **Queues** tab (opt-in, see above)
 - **Action Controller** — `process_action.action_controller` (controller#action, status, path)
 - **Active Job** — `perform_start.active_job`, `perform.active_job`, `enqueue.active_job`, `discard.active_job`, `retry_stopped.active_job`

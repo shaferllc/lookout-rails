@@ -6,6 +6,7 @@
 require "base64"
 require "digest"
 require "json"
+require "logger"
 require "net/http"
 require "securerandom"
 require "time" # Time#iso8601 (stdlib); under Rails it's already loaded, but don't depend on load order
@@ -232,6 +233,33 @@ module LookoutFramework
     end
   end
 
+  # Opt-in logger that mirrors Rails.logger writes into LookoutFramework.log. Attached to the
+  # broadcast logger so existing logging is unchanged; a thread-local guard prevents the SDK's own
+  # logging from re-entering and looping.
+  class LogForwarder < ::Logger
+    SEVERITIES = { 0 => "debug", 1 => "info", 2 => "warn", 3 => "error", 4 => "fatal", 5 => "info" }.freeze
+
+    def initialize(min_level)
+      super(File::NULL)
+      self.level = min_level
+    end
+
+    def add(severity, message = nil, progname = nil)
+      sev = severity || UNKNOWN
+      return true if sev < level
+      return true if Thread.current[:_lookout_in_log]
+
+      Thread.current[:_lookout_in_log] = true
+      begin
+        text = (message || (block_given? ? yield : progname)).to_s
+        LookoutFramework.log(SEVERITIES.fetch(sev, "info"), text, logger: (message.nil? ? nil : progname&.to_s))
+      ensure
+        Thread.current[:_lookout_in_log] = false
+      end
+      true
+    end
+  end
+
   class << self
     attr_writer :api_key, :base_uri, :ingest_path
 
@@ -257,6 +285,15 @@ module LookoutFramework
 
     def job_ingest_path
       @job_ingest_path ||= ENV.fetch("LOOKOUT_JOB_INGEST_PATH", "/api/ingest/job")
+    end
+
+    def log_ingest_path
+      @log_ingest_path ||= ENV.fetch("LOOKOUT_LOG_INGEST_PATH", "/api/ingest/log")
+    end
+
+    # Flush the log buffer once it reaches this many entries (server caps a batch at 200).
+    def logs_max_buffer
+      @logs_max_buffer ||= [[ENV.fetch("LOOKOUT_LOGS_MAX_BUFFER", "50").to_i, 1].max, 200].min
     end
 
     # Cap on child spans per request trace (server allows root + 199 children; stay under it).
@@ -339,6 +376,24 @@ module LookoutFramework
       !!remote_config.dig("signals", "jobs", "enabled")
     end
 
+    # Explicit env override for the logs signal, or nil when unset (env > site).
+    def logs_env_override
+      raw = ENV["LOOKOUT_LOGS_ENABLED"]
+      return nil if raw.nil? || raw.to_s.strip.empty?
+
+      %w[1 true yes on].include?(raw.to_s.strip.downcase)
+    end
+
+    # Whether to forward log records to the Logs watcher. Defaults OFF (opt-in like the other
+    # optional signals): LOOKOUT_LOGS_ENABLED=1 (force-accepts via X-Lookout-Env-Forced) or the
+    # dashboard signal.
+    def logs_enabled?
+      override = logs_env_override
+      return override unless override.nil?
+
+      !!remote_config.dig("signals", "logs", "enabled")
+    end
+
     # Cached per-project ingest config from GET /api/config. Cached in-process for remote_config_ttl
     # seconds (this runs in a long-lived Rails process); refreshed lazily when stale.
     def remote_config
@@ -416,6 +471,7 @@ module LookoutFramework
         store.add(type: "http", category: "controller", level: "info", message: "#{cname}##{action} → #{status}")
         report_http_not_found(payload) if status.to_i == 404
         finish_trace!(payload, finish) if trace
+        flush_logs!(async: true)
       end
 
       ActiveSupport::Notifications.subscribe("perform_start.active_job") do |_name, _start, _finish, _id, payload|
@@ -439,6 +495,7 @@ module LookoutFramework
         jname = job ? job.class.name : "unknown"
         store.add(type: "queue", category: "job", level: "info", message: "perform.active_job: #{jname}")
         finish_job_run!(payload) if job && job_runs.key?(job_run_key(job))
+        flush_logs!
       end
 
       %w[enqueue.active_job discard.active_job retry_stopped.active_job].each do |ev|
@@ -448,6 +505,12 @@ module LookoutFramework
           store.add(type: "queue", category: "job", level: "info", message: "#{ev}: #{jname}")
         end
       end
+
+      # Drain any buffered logs when the process exits (covers short-lived CLI/rake runs).
+      at_exit { flush_logs! }
+
+      # Opt-in: mirror Rails.logger output to the Logs watcher (LOOKOUT_FORWARD_RAILS_LOG=1).
+      attach_log_forwarder! if forward_rails_log?
 
       # Subscribe to SQL when either feature wants it: breadcrumbs (LOOKOUT_INSTRUMENT_SQL, sampled)
       # and/or db.query child spans for request traces (when performance is enabled at boot).
@@ -614,7 +677,64 @@ module LookoutFramework
         raise
       ensure
         finish_command_trace!(exit_code)
+        flush_logs!
       end
+    end
+
+    # Forward a structured log record to the Logs watcher. Buffered and flushed in batches (at request
+    # / job / command end, at process exit, or when the buffer fills). attributes is an optional Hash.
+    #
+    #   LookoutFramework.log(:warn, "Payment retry", attempt: 2, order_id: 17)
+    def log(level, message, attributes = nil, logger: nil)
+      return unless logs_enabled?
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      entry = {
+        "level" => normalize_log_level(level),
+        "message" => message.to_s[0, 262_144],
+        "source" => "ruby",
+        "logger" => (logger || "rails").to_s[0, 128],
+        "timestamp" => Time.now.to_f
+      }
+      entry["environment"] = environment unless environment.to_s.empty?
+      active = trace
+      entry["trace_id"] = active["trace_id"] if active && active["trace_id"]
+      attrs = log_attributes(attributes)
+      entry["attributes"] = attrs if attrs
+
+      size = nil
+      log_mutex.synchronize do
+        log_buffer << entry
+        size = log_buffer.size
+      end
+      flush_logs!(async: true) if size >= logs_max_buffer
+      nil
+    rescue StandardError
+      nil
+    end
+
+    # Post any buffered log entries to the log ingest API (in chunks of 200). async: post off-thread
+    # (used on the web request path); synchronous flushes are used at job/command end and at exit.
+    def flush_logs!(async: false)
+      batch = nil
+      log_mutex.synchronize do
+        return nil if log_buffer.empty?
+
+        batch = log_buffer.slice!(0, log_buffer.length)
+      end
+      return nil if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      poster = lambda do
+        batch.each_slice(200) do |chunk|
+          post_to(log_ingest_path, { "entries" => chunk }, env_forced: logs_env_override == true)
+        rescue StandardError
+          nil
+        end
+      end
+      async ? Thread.new { poster.call } : poster.call
+      nil
+    rescue StandardError
+      nil
     end
 
     def reset_store!
@@ -677,6 +797,71 @@ module LookoutFramework
         "status" => "ok",
         "data" => data
       }
+    end
+
+    def forward_rails_log?
+      %w[1 true yes on].include?(ENV["LOOKOUT_FORWARD_RAILS_LOG"].to_s.strip.downcase)
+    end
+
+    # Minimum Ruby Logger severity to forward (default WARN to avoid flooding the Logs watcher with
+    # dev info/SQL chatter). Accepts a name (debug/info/warn/error/fatal).
+    def log_forward_min_level
+      name = ENV.fetch("LOOKOUT_FORWARD_RAILS_LOG_LEVEL", "warn").to_s.strip.downcase
+      { "debug" => Logger::DEBUG, "info" => Logger::INFO, "warn" => Logger::WARN,
+        "error" => Logger::ERROR, "fatal" => Logger::FATAL }.fetch(name, Logger::WARN)
+    end
+
+    def attach_log_forwarder!
+      return unless defined?(Rails) && Rails.respond_to?(:logger) && Rails.logger
+
+      forwarder = LogForwarder.new(log_forward_min_level)
+      if Rails.logger.respond_to?(:broadcast_to)
+        Rails.logger.broadcast_to(forwarder)
+      elsif defined?(ActiveSupport::Logger) && ActiveSupport::Logger.respond_to?(:broadcast)
+        Rails.logger.extend(ActiveSupport::Logger.broadcast(forwarder))
+      end
+    rescue StandardError
+      nil
+    end
+
+    # Process-wide log buffer (logs originate on many Puma/job threads), guarded by a mutex.
+    def log_buffer
+      @log_buffer ||= []
+    end
+
+    def log_mutex
+      @log_mutex ||= Mutex.new
+    end
+
+    # Normalize to the server's level vocabulary (mirrors the PHP/Monolog handler).
+    def normalize_log_level(level)
+      l = level.to_s.strip.downcase
+      l = "info" if l == "notice"
+      l = "warn" if l == "warning"
+      l = "fatal" if %w[critical alert emergency].include?(l)
+      l = "info" if l.empty?
+      l[0, 32]
+    end
+
+    # Coerce a context Hash into the server's attribute shape: <=64 keys, scalar/null kept as-is,
+    # everything else JSON-encoded.
+    def log_attributes(attributes)
+      return nil unless attributes.is_a?(Hash) && attributes.any?
+
+      out = {}
+      attributes.first(64).each do |key, value|
+        k = key.to_s[0, 128]
+        out[k] = if value.is_a?(String) || value.is_a?(Numeric) || value == true || value == false || value.nil?
+          value
+        else
+          begin
+            JSON.generate(value)[0, 8192]
+          rescue StandardError
+            value.to_s[0, 8192]
+          end
+        end
+      end
+      out.empty? ? nil : out
     end
 
     # Per-thread map of in-flight job runs, keyed by job id, holding the client-generated run_id and
@@ -920,6 +1105,8 @@ module LookoutFramework
       overrides["traces"] = { "enabled" => traces } unless traces.nil?
       jobs = jobs_env_override
       overrides["jobs"] = { "enabled" => jobs } unless jobs.nil?
+      logs = logs_env_override
+      overrides["logs"] = { "enabled" => logs } unless logs.nil?
       return nil if overrides.empty?
 
       Base64.strict_encode64(JSON.generate(overrides))
