@@ -350,6 +350,10 @@ module LookoutFramework
       @batch_ingest_path ||= ENV.fetch("LOOKOUT_BATCH_INGEST_PATH", "/api/ingest/batch")
     end
 
+    def auth_ingest_path
+      @auth_ingest_path ||= ENV.fetch("LOOKOUT_AUTH_INGEST_PATH", "/api/ingest/auth")
+    end
+
     # Buffered batch signals share one transport (POST {path} {entries:[...]}). Each maps to its
     # ingest path, its LOOKOUT_<X>_ENABLED env override, and its GET /api/config signal key.
     BATCH_SIGNALS = {
@@ -476,6 +480,27 @@ module LookoutFramework
       return override unless override.nil?
 
       !!remote_config.dig("signals", "mail", "enabled")
+    end
+
+    # Explicit env override for the auth signal, or nil when unset (env > site).
+    def auth_env_override
+      raw = ENV["LOOKOUT_AUTH_ENABLED"]
+      return nil if raw.nil? || raw.to_s.strip.empty?
+
+      %w[1 true yes on].include?(raw.to_s.strip.downcase)
+    end
+
+    # Whether to report Warden/Devise authentication events to the Authentication watcher. Opt-in
+    # (defaults OFF): LOOKOUT_AUTH_ENABLED=1 (also force-accepts via X-Lookout-Env-Forced) or the
+    # dashboard signal.
+    def auth_enabled?
+      signal_enabled?("LOOKOUT_AUTH_ENABLED", "auth")
+    end
+
+    # Whether to emit file.* spans for ActiveStorage operations (Storage watcher). Trace-based, so it
+    # also needs performance/traces enabled at boot. Opt-in (defaults OFF).
+    def filesystem_monitoring_enabled?
+      signal_enabled?("LOOKOUT_FILESYSTEM_ENABLED", "filesystem")
     end
 
     # Cached per-project ingest config from GET /api/config. Cached in-process for remote_config_ttl
@@ -630,6 +655,36 @@ module LookoutFramework
       # Opt-in outbound-HTTP + Redis instrumentation (no standard ActiveSupport events for these).
       instrument_http! if env_flag("LOOKOUT_INSTRUMENT_HTTP")
       instrument_redis! if env_flag("LOOKOUT_INSTRUMENT_REDIS")
+
+      # Warden (and therefore Devise) authentication lifecycle → Authentication watcher. Warden's
+      # callbacks are no-ops when the gem is absent, so guard on its presence.
+      if auth_enabled? && defined?(Warden) && Warden.respond_to?(:manager)
+        Warden::Manager.after_authentication do |user, auth, opts|
+          record_auth_event("login", user, auth, opts)
+        end
+        Warden::Manager.before_logout do |user, auth, opts|
+          record_auth_event("logout", user, auth, opts)
+        end
+        Warden::Manager.after_failed_fetch do |user, auth, opts|
+          record_auth_event("failed", user, auth, opts)
+        end
+      end
+
+      # ActiveStorage service operations → file.* child spans → Storage watcher. Trace-based, so this
+      # only records inside an active request trace (needs performance enabled at boot too).
+      if traces_enabled? && filesystem_monitoring_enabled?
+        ActiveSupport::Notifications.subscribe("service_upload.active_storage") do |_n, qs, qf, _i, payload|
+          record_storage_span("file.write", qs, qf, payload)
+        end
+        %w[service_download.active_storage service_streaming_download.active_storage].each do |ev|
+          ActiveSupport::Notifications.subscribe(ev) do |_n, qs, qf, _i, payload|
+            record_storage_span("file.read", qs, qf, payload)
+          end
+        end
+        ActiveSupport::Notifications.subscribe("service_delete.active_storage") do |_n, qs, qf, _i, payload|
+          record_storage_span("file.delete", qs, qf, payload)
+        end
+      end
 
       # Subscribe to SQL when either feature wants it: breadcrumbs (LOOKOUT_INSTRUMENT_SQL, sampled)
       # and/or db.query child spans for request traces (when performance is enabled at boot).
@@ -1062,6 +1117,32 @@ module LookoutFramework
       }
     end
 
+    # Append a file.* child span (Storage watcher) for an ActiveStorage service operation. op is one
+    # of file.read/file.write/file.delete. Records the key (path) + service (disk) + byte size only;
+    # never the file contents.
+    def record_storage_span(op, qstart, qfinish, payload)
+      t = trace
+      return if t.nil? || t["spans"].size >= trace_max_spans
+
+      duration = span_duration(qstart, qfinish)
+      ended = Time.now.to_f
+      key = payload[:key].to_s
+      data = { "file.duration_ms" => (duration * 1000).round(3) }
+      data["file.path"] = key[0, 512] unless key.empty?
+      data["file.disk"] = payload[:service].to_s if payload[:service]
+      data["file.bytes"] = payload[:byte_size].to_i if payload[:byte_size]
+      t["spans"] << {
+        "span_id" => SecureRandom.hex(8),
+        "parent_span_id" => t["root_id"],
+        "op" => op,
+        "description" => "#{op} #{key}".strip[0, 512],
+        "start_timestamp" => ended - duration,
+        "end_timestamp" => ended,
+        "status" => "ok",
+        "data" => data
+      }
+    end
+
     # Append an http.client child span (HTTP Client watcher) for an outbound Net::HTTP request.
     # Skips calls to our own ingest host so the SDK never traces itself.
     def record_http_span(http, request, response, started_mono, error = nil)
@@ -1357,6 +1438,73 @@ module LookoutFramework
       nil
     end
 
+    # Build + post an Authentication-watcher record from a Warden hook (off-thread, like mail).
+    # Warden underpins Devise, so its after_authentication/before_logout/after_failed_fetch hooks
+    # cover Devise sign-in/out/failure — we deliberately do NOT also subscribe Devise's EventBus or
+    # events would double-count. Rails therefore emits login/logout/failed only; the server's other
+    # event types (registered/password_reset/verified/lockout) come from app-specific flows. Never
+    # sends passwords or raw credentials.
+    def record_auth_event(event_type, user, auth, opts)
+      return if api_key.to_s.empty? || base_uri.to_s.empty?
+
+      entry = { "event_type" => event_type }
+      scope = (opts && (opts[:scope] || opts["scope"]))
+      entry["guard"] = scope.to_s[0, 64] unless scope.to_s.empty?
+
+      uid = (user.id.to_s if user.respond_to?(:id) && !user.id.nil?)
+      entry["auth_user_id"] = uid[0, 64] if uid && !uid.empty?
+      label = auth_user_label(user)
+      entry["auth_user_label"] = label[0, 255] if label
+
+      ip, ua = warden_request_context(auth)
+      entry["ip_address"] = ip[0, 45] if ip
+      entry["user_agent"] = ua[0, 512] if ua
+
+      remember = opts && (opts[:remember] || opts["remember"])
+      entry["remember"] = true if remember == true
+
+      with_common(entry)
+      forced = auth_env_override == true
+      Thread.new do
+        post_to(auth_ingest_path, entry, env_forced: forced)
+      rescue StandardError
+        nil
+      end
+    rescue StandardError
+      nil
+    end
+
+    # Best-effort human label for the authenticated user (email, then a name/username), never raising.
+    def auth_user_label(user)
+      return nil if user.nil?
+
+      %i[email user_email username login name display_name].each do |attr|
+        next unless user.respond_to?(attr)
+
+        value = begin
+          user.public_send(attr)
+        rescue StandardError
+          nil
+        end
+        return value.to_s if value && !value.to_s.strip.empty?
+      end
+      nil
+    rescue StandardError
+      nil
+    end
+
+    # Pull client IP + user-agent off the Warden proxy's Rack request, when reachable.
+    def warden_request_context(auth)
+      request = auth && auth.respond_to?(:request) ? auth.request : nil
+      return [nil, nil] if request.nil?
+
+      ip = request.respond_to?(:ip) ? request.ip.to_s : nil
+      ua = request.respond_to?(:user_agent) ? request.user_agent.to_s : nil
+      [(ip if ip && !ip.empty?), (ua if ua && !ua.empty?)]
+    rescue StandardError
+      [nil, nil]
+    end
+
     # Post a single cron check-in synchronously (CLI processes exit promptly; two-phase ordering).
     def post_cron(slug, status, check_in_id, duration = nil)
       body = { "slug" => slug.to_s[0, 128], "status" => status, "check_in_id" => check_in_id }
@@ -1634,7 +1782,8 @@ module LookoutFramework
         "mail" => "LOOKOUT_MAIL_ENABLED", "models" => "LOOKOUT_MODELS_ENABLED",
         "events" => "LOOKOUT_EVENTS_ENABLED", "gates" => "LOOKOUT_GATES_ENABLED",
         "metrics" => "LOOKOUT_METRICS_ENABLED", "crons" => "LOOKOUT_CRON_ENABLED",
-        "batches" => "LOOKOUT_BATCHES_ENABLED", "feedback" => "LOOKOUT_FEEDBACK_ENABLED"
+        "batches" => "LOOKOUT_BATCHES_ENABLED", "feedback" => "LOOKOUT_FEEDBACK_ENABLED",
+        "auth" => "LOOKOUT_AUTH_ENABLED", "filesystem" => "LOOKOUT_FILESYSTEM_ENABLED"
       }.each do |key, env_name|
         flag = env_flag(env_name)
         overrides[key] = { "enabled" => flag } unless flag.nil?
