@@ -252,7 +252,7 @@ module LookoutFramework
       Thread.current[:_lookout_in_log] = true
       begin
         text = (message || (block_given? ? yield : progname)).to_s
-        LookoutFramework.log(SEVERITIES.fetch(sev, "info"), text, logger: (message.nil? ? nil : progname&.to_s))
+        LookoutFramework.log(SEVERITIES.fetch(sev, "info"), text, nil, (message.nil? ? nil : progname&.to_s))
       ensure
         Thread.current[:_lookout_in_log] = false
       end
@@ -860,7 +860,7 @@ module LookoutFramework
     # / job / command end, at process exit, or when the buffer fills). attributes is an optional Hash.
     #
     #   LookoutFramework.log(:warn, "Payment retry", attempt: 2, order_id: 17)
-    def log(level, message, attributes = nil, logger: nil)
+    def log(level, message, attributes = nil, logger = nil)
       return unless logs_enabled?
       return if api_key.to_s.empty? || base_uri.to_s.empty?
 

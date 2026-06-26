@@ -14,7 +14,10 @@ class JobTest < Minitest::Test
 
   # Minimal stand-in for an ActiveJob instance.
   class FakeJob
-    def self.queue_adapter_name = "async"
+    def self.queue_adapter_name
+      "async"
+    end
+
     attr_reader :job_id, :queue_name, :executions
 
     def initialize(job_id: "job-1", queue_name: "default", executions: 1)

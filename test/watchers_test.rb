@@ -13,8 +13,13 @@ class WatchersTest < Minitest::Test
   SIGNALS = %w[EVENTS GATES METRICS MODELS MAIL CRON BATCHES FEEDBACK].freeze
 
   class FakeModel
-    def id = 7
-    def saved_changes = { "name" => %w[a b], "updated_at" => [1, 2] }
+    def id
+      7
+    end
+
+    def saved_changes
+      { "name" => %w[a b], "updated_at" => [1, 2] }
+    end
   end
 
   def setup
