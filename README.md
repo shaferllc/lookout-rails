@@ -2,6 +2,8 @@
 
 Copy-paste **Ruby on Rails** instrumentation (not a published gem) that mirrors what `lookout/tracing` does for Laravel: breadcrumbs for HTTP, Active Job, and optional SQL / custom `ActiveSupport::Notifications`, plus posting uncaught errors to Lookout’s `POST /api/ingest`.
 
+**Free dashboard:** [Create a free Starter account](https://uselookout.app/register) (no credit card) — one project, thousands of events/month. Copy your project API key from Settings and view grouped errors in the web UI.
+
 **Location in the Lookout monorepo:** `packages/lookout-rails/`. This directory is **git subtree split** to a standalone mirror repository when `SPLIT_LOOKOUT_RAILS_REPO` is configured (same pattern as `lookout/cli` and `lookout/tracing`).
 
 ## Setup
