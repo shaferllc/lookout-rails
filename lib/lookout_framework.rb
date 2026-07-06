@@ -311,6 +311,183 @@ module LookoutFramework
     end
   end
 
+  # Self-contained local debug page ("Lookout's Ignition", Rails edition):
+  # exception headline, stack frames with source snippets read from disk,
+  # breadcrumbs, and a copy-as-Markdown button. Renders entirely in-process —
+  # source lines never leave the machine.
+  class DebugPage
+    CONTEXT_RADIUS = 8
+    MAX_SOURCE_FRAMES = 12
+
+    def render(exception, breadcrumbs: [], context: {})
+      klass = exception.class.name.to_s
+      message = exception.message.to_s
+      message = klass if message.empty?
+      frames = parse_backtrace(exception)
+      markdown = build_markdown(klass, message, frames, breadcrumbs, context)
+
+      <<~HTML
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8"><meta name="robots" content="noindex,nofollow">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>#{h(klass)} — Lookout</title>
+        <style>
+        :root{--bg:#0f1115;--panel:#171a21;--line:#262c38;--text:#e6e9ef;--muted:#8b93a7;--dim:#5b6376;--accent:#f0506e;--accent-soft:#3a1f2a;--amber:#f5b14c;--amber-soft:#3a2f1a;--code:#c9d1e4;}
+        html,body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+        code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+        .wrap{max-width:1100px;margin:0 auto;padding:24px 20px 80px}
+        .top{border-left:4px solid var(--accent);background:linear-gradient(90deg,var(--accent-soft),transparent 60%);padding:16px 18px;border-radius:8px;margin-bottom:18px}
+        .cls{color:var(--accent);font-size:15px;font-weight:600;margin-bottom:4px}
+        h1{margin:0;font-size:20px;word-break:break-word}
+        .btn{display:inline-block;margin-top:12px;padding:6px 12px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--text);font-weight:600;font-size:12px;cursor:pointer}
+        .frame{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin-bottom:10px;overflow:hidden}
+        .frame .hd{padding:8px 12px;color:var(--muted);font-size:12px;border-bottom:1px solid var(--line);word-break:break-all}
+        pre.code{margin:0;overflow-x:auto;font-size:12.5px;color:var(--code);padding:8px 0}
+        pre.code span{display:block;padding:0 12px;white-space:pre}
+        pre.code span.hl{background:var(--amber-soft)}
+        details{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin-top:12px}
+        summary{padding:10px 14px;cursor:pointer;font-weight:600;font-size:13px}
+        .crumb{display:flex;gap:10px;padding:6px 14px;border-top:1px solid var(--line);font-size:12px}
+        .crumb .lvl{min-width:56px;color:var(--dim);text-transform:uppercase;font-size:10px}
+        .crumb .cat{color:var(--muted);min-width:110px}
+        .crumb .msg{color:var(--code);word-break:break-word}
+        .foot{margin-top:26px;color:var(--dim);font-size:11px;text-align:center}
+        </style>
+        </head>
+        <body><div class="wrap">
+        <div class="top">
+        <div class="cls">#{h(klass)}</div>
+        <h1>#{h(message)}</h1>
+        <button class="btn" id="lk-md">Copy as Markdown</button>
+        </div>
+        #{frames_html(frames)}
+        #{breadcrumbs_html(breadcrumbs)}
+        <div class="foot">Rendered locally by Lookout · source snippets never leave this machine</div>
+        </div>
+        <script type="application/json" id="lk-copy-data">#{json_island(markdown)}</script>
+        <script>
+        (function(){
+          var data={};try{data=JSON.parse(document.getElementById("lk-copy-data").textContent||"{}")}catch(e){}
+          var b=document.getElementById("lk-md");
+          if(b){b.addEventListener("click",function(){
+            (navigator.clipboard?navigator.clipboard.writeText(data.markdown||""):Promise.reject()).then(function(){
+              b.textContent="Copied ✓";setTimeout(function(){b.textContent="Copy as Markdown"},1500);
+            }).catch(function(){});
+          });}
+        })();
+        </script>
+        </body></html>
+      HTML
+    end
+
+    private
+
+    def parse_backtrace(exception)
+      Array(exception.backtrace).first(60).map do |line|
+        if (m = line.match(/^(.*?):(\d+)(?::in [`'](.*)')?$/))
+          { file: m[1], line: m[2].to_i, function: m[3].to_s }
+        else
+          { file: line, line: 0, function: "" }
+        end
+      end
+    end
+
+    def source_window(file, line)
+      return nil unless file && line.to_i >= 1 && File.file?(file) && File.readable?(file)
+      return nil if File.size(file) > 2_000_000
+
+      lines = File.readlines(file, chomp: true)
+      return nil if line > lines.size
+
+      from = [line - 1 - CONTEXT_RADIUS, 0].max
+      to = [line - 1 + CONTEXT_RADIUS, lines.size - 1].min
+      { from: from + 1, lines: lines[from..to], target: line }
+    rescue StandardError
+      nil
+    end
+
+    def frames_html(frames)
+      enriched = 0
+      frames.map do |f|
+        window = enriched < MAX_SOURCE_FRAMES ? source_window(f[:file], f[:line]) : nil
+        enriched += 1 if window
+        body = if window
+          n = window[:from] - 1
+          rows = window[:lines].map do |text|
+            n += 1
+            %(<span class="#{n == window[:target] ? 'hl' : ''}">#{format('%5d', n)}  #{h(text)}</span>)
+          end
+          %(<pre class="code">#{rows.join}</pre>)
+        else
+          ""
+        end
+        %(<div class="frame"><div class="hd">#{h(f[:file])}:#{f[:line]} #{h(f[:function])}</div>#{body}</div>)
+      end.join("\n")
+    end
+
+    def breadcrumbs_html(breadcrumbs)
+      return "" if breadcrumbs.nil? || breadcrumbs.empty?
+
+      rows = breadcrumbs.reverse.map do |c|
+        c = c.transform_keys(&:to_s) if c.respond_to?(:transform_keys)
+        %(<div class="crumb"><span class="lvl">#{h(c['level'].to_s)}</span><span class="cat">#{h(c['category'].to_s)}</span><span class="msg">#{h(c['message'].to_s)}</span></div>)
+      end
+      %(<details open><summary>Breadcrumbs (#{breadcrumbs.size})</summary>#{rows.join}</details>)
+    end
+
+    def build_markdown(klass, message, frames, breadcrumbs, context)
+      lines = ["# #{klass}: #{message}", ""]
+      context.each { |k, v| lines << "- **#{k}:** #{v}" }
+      lines << "" unless context.empty?
+      lines << "## Stack trace" << "" << "```"
+      frames.each_with_index { |f, i| lines << "##{i} #{f[:file]}:#{f[:line]}  #{f[:function]}" }
+      lines << "```" << ""
+      unless breadcrumbs.nil? || breadcrumbs.empty?
+        lines << "## Breadcrumbs (#{breadcrumbs.size})" << ""
+        breadcrumbs.reverse.each do |c|
+          c = c.transform_keys(&:to_s) if c.respond_to?(:transform_keys)
+          lines << "- `#{c['level']}` **#{c['category']}** #{c['message']}"
+        end
+        lines << ""
+      end
+      lines.join("\n")
+    end
+
+    def json_island(markdown)
+      JSON.generate({ "markdown" => markdown }).gsub("<", "\\u003c")
+    end
+
+    def h(str)
+      str.to_s.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;").gsub('"', "&quot;")
+    end
+  end
+
+  # Rack middleware: report the exception to Lookout, then (when the debug page
+  # is enabled — LOOKOUT_DEBUG_PAGE, defaulting to Rails dev mode) show the
+  # local debug page instead of the host's error screen. Re-raises otherwise so
+  # the app's normal error handling is untouched.
+  class DebugMiddleware
+    def initialize(app)
+      @app = app
+    end
+
+    def call(env)
+      @app.call(env)
+    rescue Exception => e # rubocop:disable Lint/RescueException — must re-raise
+      begin
+        LookoutFramework.report_exception(e)
+      rescue StandardError
+        nil
+      end
+      raise unless LookoutFramework.debug_page_enabled?
+
+      html = LookoutFramework.render_debug_page(e)
+      [500, { "Content-Type" => "text/html; charset=UTF-8", "Content-Length" => html.bytesize.to_s }, [html]]
+    end
+  end
+
   class << self
     attr_writer :api_key, :base_uri, :ingest_path
 
@@ -718,6 +895,23 @@ module LookoutFramework
       ActiveSupport::Notifications.subscribe(pattern) do |name, _start, _finish, _id, _payload|
         store.add(type: "event", category: "notification", level: "info", message: name.to_s)
       end
+    end
+
+    # Whether uncaught exceptions should render the local debug page.
+    # LOOKOUT_DEBUG_PAGE wins; otherwise on in Rails development only.
+    def debug_page_enabled?
+      flag = ENV["LOOKOUT_DEBUG_PAGE"]
+      return %w[1 true yes on].include?(flag.to_s.downcase) unless flag.nil? || flag.empty?
+
+      defined?(Rails) && Rails.respond_to?(:env) && Rails.env.development?
+    end
+
+    def render_debug_page(exception)
+      DebugPage.new.render(
+        exception,
+        breadcrumbs: store.breadcrumbs.dup,
+        context: send(:ruby_context)
+      )
     end
 
     def report_exception(exception)
@@ -1697,7 +1891,7 @@ module LookoutFramework
     def ruby_context
       {
         "ruby_version" => RUBY_VERSION,
-        "rails_version" => (Rails.version if defined?(Rails))
+        "rails_version" => (Rails.version if defined?(Rails) && Rails.respond_to?(:version))
       }.compact
     end
 
