@@ -27,6 +27,7 @@ Copy-paste **Ruby on Rails** instrumentation (not a published gem) that mirrors 
 |----------|---------|
 | `LOOKOUT_API_KEY` | Project API key |
 | `LOOKOUT_BASE_URI` | Lookout origin (no trailing slash) |
+| `LOOKOUT_RELEASE` | Release identifier (e.g. git SHA, semver tag) tagged on error events. Enables release-aware regression detection and the fixed-in-release auto-resolve policy. |
 | `LOOKOUT_INSTRUMENT_SQL` | `1` to record sampled `sql.active_record` breadcrumbs |
 | `LOOKOUT_PERFORMANCE_ENABLED` | `1` to capture HTTP **request traces** (env > site; force-accepts via `X-Lookout-Env-Forced`). Unset = follow the dashboard |
 | `LOOKOUT_TRACE_MAX_SPANS` | Cap on child spans per request trace (default `190`, server allows 200 incl. root) |

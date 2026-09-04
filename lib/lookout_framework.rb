@@ -554,6 +554,10 @@ module LookoutFramework
       @environment ||= ENV["LOOKOUT_ENVIRONMENT"]
     end
 
+    def release
+      @release ||= ENV["LOOKOUT_RELEASE"]
+    end
+
     def max_breadcrumbs
       @max_breadcrumbs ||= ENV.fetch("LOOKOUT_BREADCRUMBS_MAX", "50").to_i
     end
@@ -1896,6 +1900,7 @@ module LookoutFramework
     end
 
     def post_ingest(body)
+      body["release"] = release unless release.to_s.empty?
       post_to(ingest_path, body)
     end
 
